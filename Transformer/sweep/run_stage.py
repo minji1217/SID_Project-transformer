@@ -231,6 +231,8 @@ def success_row(
         "seed",
         "total_parameters",
         "trainable_parameters",
+        "peak_gpu_memory_mb",
+        "peak_gpu_memory_reserved_mb",
         "amp_dtype",
         "gpu",
         "base_config_sha256",
@@ -397,7 +399,14 @@ def main() -> int:
         "train.save_optimizer_state": bool(args.keep_optimizer_state),
     }
 
-    carried_configs = load_carried_configs(sweep_dir, args.stage)
+    try:
+        carried_configs = load_carried_configs(sweep_dir, args.stage)
+    except (FileNotFoundError, ValueError) as error:
+        print("=" * 78)
+        print("이전 단계의 결과를 읽을 수 없습니다.")
+        print("=" * 78)
+        print(error)
+        return 1
 
     print("=" * 78)
     print(f"Stage {args.stage}/{len(STAGES)}  {stage.name}")

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sys
 
+from sweep.run_seed_robustness import DEFAULT_SEEDS
 from sweep.stages import STAGES, get_stage, is_final_stage, total_run_estimate
 from sweep.testing import Checker
 
@@ -47,6 +48,30 @@ def main() -> int:
 
     checker.section("총 run 수")
     checker.equals("total_run_estimate()", total_run_estimate(), 84)
+
+    # 단계별 run 수를 직접 세어 84가 맞는지 다시 확인한다
+    expected_runs = [8, 14, 6, 8, 24, 24]
+    carried = 1
+    counted = 0
+
+    for index, expected in enumerate(expected_runs, 1):
+        stage = get_stage(index)
+        runs = carried * len(stage.variants)
+        checker.equals(f"Stage {index} run 수", runs, expected)
+        counted += runs
+        carried = min(stage.top_k, runs)
+
+    checker.equals("단계별 합계", counted, 84)
+
+    checker.section("Seed robustness run 수")
+    checker.equals("기본 seed 수", len(DEFAULT_SEEDS), 3)
+    checker.equals("기본 seed 값", list(DEFAULT_SEEDS), [42, 123, 2026])
+    checker.equals("Final Top-k", get_stage(6).top_k, 3)
+    checker.equals(
+        "Final Top-3 x seed 3 = 9 full run",
+        get_stage(6).top_k * len(DEFAULT_SEEDS),
+        9,
+    )
 
     checker.section("Architecture 조합")
     arch_variants = get_stage(2).variants

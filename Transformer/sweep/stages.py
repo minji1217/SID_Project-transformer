@@ -58,6 +58,33 @@ METRIC_PRIORITY: List[MetricRule] = [
 ]
 
 
+# ------------------------------------------------------------ 동점 처리 규칙
+#
+# 지표 7개까지 봐도 성능이 사실상 같다면, 성능이 아닌 비용으로 고른다.
+# 같은 성능이면 작고 빠르고 메모리를 덜 쓰는 설정이 낫다.
+#   - 작은 모델은 과적합 위험이 낮고 추론도 빠르다
+#   - 짧은 학습 시간은 남은 단계의 탐색 비용을 줄인다
+#   - GPU 메모리 여유는 뒤 단계에서 batch를 키울 수 있게 한다
+#
+# tolerance는 0이다. 여기까지 왔다는 것은 성능 판단이 이미 끝났다는 뜻이므로
+# 비용은 조금이라도 낮은 쪽을 고른다.
+
+TIEBREAK_RULES: List[MetricRule] = [
+    MetricRule("total_parameters", "min", 0.0, "모델 파라미터 수"),
+    MetricRule("mean_epoch_seconds", "min", 0.0, "epoch당 학습 시간"),
+    MetricRule("peak_gpu_memory_mb", "min", 0.0, "최대 GPU 메모리"),
+]
+
+
+# 위 규칙을 모두 적용하고도 동점이면 config_hash 오름차순으로 정한다.
+# 실행 순서에 의존하지 않으므로 같은 입력이면 항상 같은 결과가 나온다.
+FINAL_TIEBREAK_KEY = "config_hash"
+
+
+# 단계별 선택에 실제로 쓰는 전체 규칙
+SELECTION_RULES: List[MetricRule] = METRIC_PRIORITY + TIEBREAK_RULES
+
+
 # ------------------------------------------------------------------- 단계 정의
 
 class Stage(NamedTuple):

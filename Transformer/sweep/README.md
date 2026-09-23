@@ -248,6 +248,38 @@ python -m sweep.preflight --config configs/transformer_ebnerd.gin --full-data-ch
 
 ---
 
+## Seed robustness 안전장치
+
+`run_seed_robustness`는 다음을 지킨다.
+
+- **모든 seed가 성공한 설정만 비교한다.** 표본 수가 다르면 평균과 표준편차를
+  나란히 놓을 수 없다. seed가 모자란 설정은 CSV에 남기되 순위에서 제외한다.
+- **하나라도 실패하면 `--accept-auto`로 확정되지 않는다.**
+  `selected_final.json`을 만들지 않고 0이 아닌 코드로 종료한다.
+  `--retry-failed`로 다시 실행하거나 사람이 직접 복사해야 한다.
+
+```bash
+python -m sweep.run_seed_robustness ... --retry-failed --accept-auto
+```
+
+---
+
+## 성능이 같을 때의 선택 기준
+
+Validation 지표 7개가 모두 tolerance 이내로 같으면 비용으로 고른다.
+
+```
+total_parameters ↑ → mean_epoch_seconds ↑ → peak_gpu_memory_mb ↑ → config_hash ↑
+```
+
+`peak_gpu_memory_mb`는 run마다 `torch.cuda.max_memory_allocated`로 측정해
+`run_summary.json`과 `summary.csv`에 저장한다.
+STEP 5에서 batch 256이 들어갈 여유가 있는지 판단할 때도 이 값을 본다.
+
+마지막 `config_hash` 기준 덕분에 선택 결과는 실행 순서에 의존하지 않는다.
+
+---
+
 ## 자동 선택을 바꾸고 싶을 때
 
 `selected_auto.json`의 `configs`를 고쳐 `selected.json`으로 저장한다.

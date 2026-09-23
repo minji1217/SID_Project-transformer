@@ -11,6 +11,7 @@ import sys
 
 from sweep.selection import (
     NotEnoughSuccessfulRuns,
+    filter_complete_seed_configs,
     pick_winner,
     rank_rows,
     select_stage_top_k,
@@ -167,6 +168,160 @@ def main() -> int:
     # top_k와 성공 수가 같으면 통과해야 한다
     ordered, _, selected = select_stage_top_k(rows, 2)
     checker.equals("top_k == 성공 수", len(selected), 2)
+
+    # ------------------------------------------------------------------
+    checker.section("8. 지표가 모두 같으면 모델 파라미터 수가 작은 쪽")
+
+    rows = [
+        row("BIG", total_parameters=20_000_000, config_hash="aaa"),
+        row("SMALL", total_parameters=10_000_000, config_hash="zzz"),
+    ]
+    winner, trace = pick_winner(rows)
+    checker.equals("승자", winner["config"], "SMALL")
+    checker.check(
+        "판단 근거에 파라미터 수가 남음",
+        any("파라미터" in line for line in trace),
+        f"trace={trace[-1:]}",
+    )
+
+    # ------------------------------------------------------------------
+    checker.section("9. 파라미터 수도 같으면 epoch당 학습 시간이 짧은 쪽")
+
+    rows = [
+        row(
+            "SLOW",
+            total_parameters=10_000_000,
+            mean_epoch_seconds=200.0,
+            config_hash="aaa",
+        ),
+        row(
+            "FAST",
+            total_parameters=10_000_000,
+            mean_epoch_seconds=100.0,
+            config_hash="zzz",
+        ),
+    ]
+    winner, trace = pick_winner(rows)
+    checker.equals("승자", winner["config"], "FAST")
+
+    # ------------------------------------------------------------------
+    checker.section("10. 시간도 같으면 GPU 메모리를 덜 쓰는 쪽")
+
+    rows = [
+        row(
+            "HEAVY",
+            total_parameters=10_000_000,
+            mean_epoch_seconds=100.0,
+            peak_gpu_memory_mb=9000.0,
+            config_hash="aaa",
+        ),
+        row(
+            "LIGHT",
+            total_parameters=10_000_000,
+            mean_epoch_seconds=100.0,
+            peak_gpu_memory_mb=4000.0,
+            config_hash="zzz",
+        ),
+    ]
+    winner, trace = pick_winner(rows)
+    checker.equals("승자", winner["config"], "LIGHT")
+
+    # ------------------------------------------------------------------
+    checker.section("11. 전부 같으면 config_hash 오름차순")
+
+    def identical(name: str, config_hash: str) -> dict:
+        return row(
+            name,
+            total_parameters=10_000_000,
+            mean_epoch_seconds=100.0,
+            peak_gpu_memory_mb=4000.0,
+            config_hash=config_hash,
+        )
+
+    rows = [
+        identical("Z", "zzz111"),
+        identical("A", "aaa999"),
+        identical("M", "mmm555"),
+    ]
+    winner, trace = pick_winner(rows)
+    checker.equals("승자", winner["config"], "A")
+    checker.check(
+        "판단 근거에 config_hash가 남음",
+        any("config_hash" in line for line in trace),
+        f"trace={trace[-1:]}",
+    )
+
+    # 입력 순서를 바꿔도 결과가 같아야 한다
+    reversed_rows = list(reversed(rows))
+    reversed_winner, _ = pick_winner(reversed_rows)
+    checker.equals(
+        "입력 순서를 바꿔도 같은 승자",
+        reversed_winner["config"],
+        "A",
+    )
+    checker.equals(
+        "전체 순위도 동일",
+        [entry[0]["config"] for entry in rank_rows(reversed_rows)],
+        ["A", "M", "Z"],
+    )
+
+    # ------------------------------------------------------------------
+    checker.section("12. 비용 기준이 성능을 뒤집지는 않는다")
+
+    rows = [
+        row(
+            "BIG_BUT_BETTER",
+            val_top1_accuracy=0.320,
+            total_parameters=50_000_000,
+            mean_epoch_seconds=900.0,
+            peak_gpu_memory_mb=20000.0,
+            config_hash="zzz",
+        ),
+        row(
+            "SMALL_BUT_WORSE",
+            val_top1_accuracy=0.300,
+            total_parameters=1_000_000,
+            mean_epoch_seconds=10.0,
+            peak_gpu_memory_mb=500.0,
+            config_hash="aaa",
+        ),
+    ]
+    winner, _ = pick_winner(rows)
+    checker.equals("승자", winner["config"], "BIG_BUT_BETTER")
+    checker.check(
+        "Top-1 차이가 tolerance 밖이면 비용 기준은 쓰이지 않음",
+        winner["config"] == "BIG_BUT_BETTER",
+    )
+
+    # ------------------------------------------------------------------
+    checker.section("13. seed가 모두 성공한 설정만 비교")
+
+    aggregate_rows = [
+        {"config": "A", "successful_seed_count": 3},
+        {"config": "B", "successful_seed_count": 2},
+        {"config": "C", "successful_seed_count": 3},
+        {"config": "D", "successful_seed_count": 0},
+    ]
+
+    complete, incomplete = filter_complete_seed_configs(aggregate_rows, 3)
+
+    checker.equals(
+        "모두 성공한 설정",
+        [entry["config"] for entry in complete],
+        ["A", "C"],
+    )
+    checker.equals(
+        "제외된 설정",
+        [entry["config"] for entry in incomplete],
+        ["B", "D"],
+    )
+
+    complete, incomplete = filter_complete_seed_configs(aggregate_rows, 2)
+    checker.equals(
+        "기대 seed 수가 2면 B만 통과",
+        [entry["config"] for entry in complete],
+        ["B"],
+    )
 
     return checker.finish()
 

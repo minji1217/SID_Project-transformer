@@ -648,6 +648,12 @@ def train(
 
     scaler = create_grad_scaler(resolved_amp_dtype)
 
+    # 이 run이 실제로 얼마나 GPU 메모리를 쓰는지 측정한다.
+    # 성능이 같은 설정 중에서 고를 때의 기준이 되고,
+    # 뒤 단계에서 batch를 키울 여유가 있는지 판단하는 근거가 된다.
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
     # Parameter count
     total_parameters = sum(
         p.numel()
@@ -885,6 +891,25 @@ def train(
             else None
         ),
         "selection_metric": "val_top1_accuracy",
+        # max_memory_allocated는 tensor가 실제로 점유한 최댓값이고,
+        # max_memory_reserved는 caching allocator가 확보한 총량이다.
+        # OOM 여유를 볼 때는 reserved 쪽이 nvidia-smi 값에 가깝다.
+        "peak_gpu_memory_mb": (
+            round(
+                torch.cuda.max_memory_allocated(device) / (1024 ** 2),
+                2,
+            )
+            if device.type == "cuda"
+            else None
+        ),
+        "peak_gpu_memory_reserved_mb": (
+            round(
+                torch.cuda.max_memory_reserved(device) / (1024 ** 2),
+                2,
+            )
+            if device.type == "cuda"
+            else None
+        ),
         "best_metrics": best_record or {},
         "base_config_path": RUN_CONTEXT.get("base_config_path"),
         "base_config_sha256": RUN_CONTEXT.get("base_config_sha256"),

@@ -134,6 +134,18 @@ def compute_config_hash(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:length]
 
 
+def params_hash(bindings: Dict[str, Any], length: int = 12) -> str:
+    # seed와 무관하게 "이 파라미터 조합"만 식별한다.
+    # seed 검증에서 설정끼리 동점일 때의 최종 판단 기준으로 쓴다.
+    payload = json.dumps(
+        {key: bindings[key] for key in sorted(bindings)},
+        sort_keys=True,
+        default=str,
+    )
+
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:length]
+
+
 def source_fingerprint(root: Path) -> Dict[str, Optional[str]]:
     # 어떤 코드로 돌린 결과인지 기록해 둔다. hash에는 넣지 않는다.
     # 코드를 고칠 때마다 모든 run을 다시 돌려야 한다면 탐색이 불가능해진다.

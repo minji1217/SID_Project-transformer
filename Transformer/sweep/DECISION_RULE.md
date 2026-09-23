@@ -42,7 +42,30 @@ Validation 지표를 아래 순서로 본다.
 | 6 | Positive Probability | 클수록 좋음 | 0.002 |
 | 7 | Positive − Negative Score Gap | 클수록 좋음 | 0 |
 
-마지막까지 동률이면 먼저 실행된 run을 선택한다.
+### 성능이 같을 때 — 비용 기준
+
+지표 7개까지 봐도 동률이면, 성능이 아닌 **비용**으로 고른다.
+같은 성능이면 작고 빠르고 메모리를 덜 쓰는 설정이 낫다.
+
+| 순위 | 기준 | 방향 | 이유 |
+|---|---|---|---|
+| 8 | `total_parameters` | 작을수록 | 과적합 위험이 낮고 추론이 빠르다 |
+| 9 | `mean_epoch_seconds` | 작을수록 | 남은 단계의 탐색 비용이 줄어든다 |
+| 10 | `peak_gpu_memory_mb` | 작을수록 | 뒤 단계에서 batch를 키울 여유가 생긴다 |
+| 11 | `config_hash` | 오름차순 | 실행 순서와 무관하게 항상 같은 결과 |
+
+tolerance는 0이다. 여기까지 왔다는 것은 성능 판단이 이미 끝났다는 뜻이므로
+비용은 조금이라도 낮은 쪽을 고른다.
+
+**비용 기준이 성능을 뒤집지는 않는다.** 앞의 7개 지표에서 이미 갈렸다면
+모델이 아무리 크고 느려도 성능이 좋은 쪽이 이긴다.
+
+`peak_gpu_memory_mb`는 각 run에서 `torch.cuda.max_memory_allocated`로 측정해
+`run_summary.json`과 `summary.csv`에 저장한다.
+CPU 학습이면 값이 비어 있고, 그 경우 이 기준은 건너뛴다.
+
+마지막 `config_hash` 기준 덕분에 **선택 결과는 실행 순서에 의존하지 않는다.**
+같은 입력이면 몇 번을 돌려도 같은 설정이 뽑힌다.
 
 ### 선정 우선순위에 넣지 않는 지표
 
@@ -202,10 +225,35 @@ Final Top-3 × seed 3개를 모두 **30 epoch / patience 5**로 새로 학습한
 5. 평균 Validation Preference Loss
 6. 평균 Positive Probability
 7. 평균 Score Gap
-8. 마지막까지 동률이면 **Top-1 표준편차가 작은 설정**
+8. **Top-1 표준편차가 작은 설정** (seed에 덜 흔들리는 쪽)
+9. `total_parameters` → `mean_epoch_seconds` → `peak_gpu_memory_mb`
+10. `config_hash` 오름차순
 
 seed는 파라미터가 아니다.
 성능이 잘 나온 seed를 고르지 않는다.
+
+### seed가 모두 성공한 설정만 비교한다
+
+**seed 3개가 모두 성공한 설정끼리만 비교한다.**
+
+seed 2개만 성공한 설정과 3개가 성공한 설정을 나란히 놓으면,
+우연히 나쁜 seed가 실패한 설정이 평균에서 유리해진다.
+평균과 표준편차를 비교하려면 표본 수가 같아야 한다.
+
+seed가 모자란 설정은 `config_aggregate.csv`에 남기되 순위에서 제외하고,
+제외된 이유를 `decision` 칸에 적는다.
+
+### 하나라도 실패하면 자동 확정하지 않는다
+
+실패한 run이 하나라도 있으면 `--accept-auto`를 써도
+`selected_final.json`을 만들지 않고 0이 아닌 코드로 종료한다.
+
+비교되지 않은 설정이 더 나았을 가능성을 모른 채 Test로 넘어가면 안 되기 때문이다.
+
+`--retry-failed`로 실패한 run을 다시 실행하거나,
+그래도 진행하겠다면 `selected_final_auto.json`을
+`selected_final.json`으로 직접 복사해야 한다.
+사람이 명시적으로 결정하게 만드는 장치다.
 
 ---
 

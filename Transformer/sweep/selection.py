@@ -13,7 +13,12 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
-from sweep.stages import METRIC_PRIORITY, MetricRule
+from sweep.stages import (
+    FINAL_TIEBREAK_KEY,
+    METRIC_PRIORITY,
+    SELECTION_RULES,
+    MetricRule,
+)
 
 
 STATUS_SUCCESS = "SUCCESS"
@@ -90,7 +95,7 @@ def pick_winner(
     # rules를 넘기면 다른 우선순위를 쓸 수 있다.
     # seed 검증에서는 지표 평균과 표준편차로 비교해야 하므로 필요하다.
     if rules is None:
-        rules = METRIC_PRIORITY
+        rules = SELECTION_RULES
 
     pool = list(rows)
     trace: List[str] = []
@@ -133,9 +138,31 @@ def pick_winner(
         pool = narrowed
 
     if len(pool) > 1:
+        # 마지막 결정은 config_hash 오름차순으로 한다.
+        # 실행 순서에 의존하지 않으므로 같은 입력이면 항상 같은 결과가 나온다.
+        with_hash = [
+            candidate
+            for candidate in pool
+            if candidate.get(FINAL_TIEBREAK_KEY)
+        ]
+
+        if with_hash:
+            winner = min(
+                with_hash,
+                key=lambda candidate: str(candidate[FINAL_TIEBREAK_KEY]),
+            )
+
+            trace.append(
+                f"{len(pool)}개가 끝까지 동률이라 "
+                f"{FINAL_TIEBREAK_KEY} 오름차순으로 결정 "
+                f"({winner[FINAL_TIEBREAK_KEY]})"
+            )
+
+            return winner, trace
+
         trace.append(
-            f"마지막까지 {len(pool)}개가 동률이라 "
-            "먼저 실행된 run을 선택"
+            f"마지막까지 {len(pool)}개가 동률이고 "
+            f"{FINAL_TIEBREAK_KEY}도 없어 먼저 실행된 run을 선택"
         )
 
     return pool[0], trace
@@ -305,3 +332,27 @@ def select_stage_top_k(
     selected = [row for row, _ in ordered[:top_k]]
 
     return ordered, failed, selected
+
+
+def filter_complete_seed_configs(
+    rows: List[Dict[str, Any]],
+    expected_seed_count: int,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    # seed 검증에서는 모든 seed가 성공한 설정만 비교한다.
+    #
+    # seed 2개만 성공한 설정과 3개가 성공한 설정을 같이 비교하면,
+    # 우연히 나쁜 seed가 실패한 설정이 평균에서 유리해진다.
+    # 평균과 표준편차를 비교하려면 표본 수가 같아야 한다.
+    complete = [
+        row
+        for row in rows
+        if row.get("successful_seed_count") == expected_seed_count
+    ]
+
+    incomplete = [
+        row
+        for row in rows
+        if row.get("successful_seed_count") != expected_seed_count
+    ]
+
+    return complete, incomplete
