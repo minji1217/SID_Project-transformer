@@ -922,6 +922,17 @@ def main() -> None:
         required=True,
     )
 
+    # gin 설정을 명령줄에서 덮어쓴다.
+    # 예: --gin-binding "train.learning_rate = 0.0002"
+    # 파라미터 탐색에서 config 파일을 복제하지 않고 값만 바꾸기 위해 사용한다.
+    parser.add_argument(
+        "--gin-binding",
+        type=str,
+        action="append",
+        default=[],
+        metavar="BINDING",
+    )
+
     args = parser.parse_args()
 
     config_path = resolve_path(
@@ -941,6 +952,15 @@ def main() -> None:
     gin.parse_config_file(
         str(config_path)
     )
+
+    # config 파일을 먼저 읽고, 그 뒤에 덮어쓴다.
+    if args.gin_binding:
+        print("Gin overrides:")
+
+        for binding in args.gin_binding:
+            print("  ", binding)
+
+        gin.parse_config(args.gin_binding)
 
     train()
 

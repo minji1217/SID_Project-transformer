@@ -10,3 +10,6 @@ Transformer/datasets/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+# 학습 및 파라미터 탐색 결과
+Transformer/out/
+Transformer/sweep_out/
