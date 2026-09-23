@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 import random
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -13,6 +16,7 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
 from data.sequence import NewsSequenceDataset, collate_news_sequences
+from evaluate.ranking import compute_ranking_metrics
 from modules.model import NewsEncoderDecoderTransformer
 from modules.loss import TransformerLoss
 
@@ -110,6 +114,9 @@ def create_metric_dict() -> Dict[str, float]:
         "negative_score_sum": 0.0,
         "positive_prob_sum": 0.0,
         "negative_prob_sum": 0.0,
+        "auc_sum": 0.0,
+        "mrr_sum": 0.0,
+        "ndcg5_sum": 0.0,
         "top1_correct": 0,
         "num_impressions": 0,
         "num_positive_candidates": 0,
@@ -147,10 +154,19 @@ def update_metrics(
     metrics["positive_prob_sum"] += float(candidate_probs[positive_mask].sum().item())
     metrics["negative_prob_sum"] += float(candidate_probs[negative_mask].sum().item())
 
-    # Top-1 Accuracy
-    predicted_indices = candidate_scores.argmax(dim=1)
-    target_indices = candidate_labels.argmax(dim=1)
-    metrics["top1_correct"] += int((predicted_indices == target_indices).sum().item())
+    # Ranking metric (Top-1 / AUC / MRR / nDCG@5)
+    # evaluate/ranking.py는 evaluate/metrics.py와 동일한 정의를 사용한다.
+    # 동점 처리까지 일치하는지는 evaluate/test_ranking.py가 검증한다.
+    ranking = compute_ranking_metrics(
+        candidate_scores=candidate_scores,
+        candidate_labels=candidate_labels,
+        k=5,
+    )
+
+    metrics["top1_correct"] += int(ranking.top1.sum().item())
+    metrics["auc_sum"] += float(ranking.auc.sum().item())
+    metrics["mrr_sum"] += float(ranking.mrr.sum().item())
+    metrics["ndcg5_sum"] += float(ranking.ndcg.sum().item())
 
     # Count
     metrics["num_impressions"] += batch_size
@@ -199,14 +215,27 @@ def finalize_metrics(
 
     top1_accuracy = metrics["top1_correct"] / num_impressions
 
+    auc = metrics["auc_sum"] / num_impressions
+    mrr = metrics["mrr_sum"] / num_impressions
+    ndcg_at_5 = metrics["ndcg5_sum"] / num_impressions
+
+    # Positive-Negative score gap
+    # 값 자체는 모델의 전체 확신도 수준에 따라 달라지므로
+    # 서로 다른 config 사이의 직접 비교보다는 진단용으로 본다.
+    score_gap = positive_score - negative_score
+
     return {
         "total_loss": total_loss,
         "preference_loss": preference_loss,
         "positive_score": positive_score,
         "negative_score": negative_score,
+        "score_gap": score_gap,
         "positive_prob": positive_prob,
         "negative_prob": negative_prob,
         "top1_accuracy": top1_accuracy,
+        "auc": auc,
+        "mrr": mrr,
+        "ndcg@5": ndcg_at_5,
         "top1_correct": int(metrics["top1_correct"]),
         "num_impressions": num_impressions,
         "num_positive_candidates": num_positive,
@@ -373,6 +402,17 @@ def print_metrics(
     )
 
     print(
+        f"{split_name} Ranking | "
+        f"MRR={metrics['mrr']:.6f} | "
+        f"nDCG@5={metrics['ndcg@5']:.6f} | "
+        f"AUC={metrics['auc']:.6f}"
+    )
+
+    print(
+        f"{split_name} Score Gap={metrics['score_gap']:.4f}"
+    )
+
+    print(
         f"{split_name} Score | "
         f"Positive={metrics['positive_score']:.4f} | "
         f"Negative={metrics['negative_score']:.4f}"
@@ -421,6 +461,46 @@ def save_checkpoint(
         )
 
     torch.save(checkpoint, path)
+
+
+def write_epoch_history(
+    path: Path,
+    epoch_records: list,
+) -> None:
+    # epoch마다의 train/validation 지표를 CSV로 남긴다.
+    # 학습 곡선 확인과 best epoch 위치 판단에 사용한다.
+    if not epoch_records:
+        return
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    fieldnames = list(epoch_records[0].keys())
+
+    with path.open("w", newline="", encoding="utf-8-sig") as fp:
+        writer = csv.DictWriter(fp, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for record in epoch_records:
+            writer.writerow(record)
+
+
+def write_run_summary(
+    path: Path,
+    summary: Dict[str, Any],
+) -> None:
+    # 이 run의 설정과 best epoch 지표를 JSON으로 남긴다.
+    # sweep이 이 파일만 읽어서 단계 요약 CSV를 만든다.
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    path.write_text(
+        json.dumps(
+            summary,
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        ),
+        encoding="utf-8",
+    )
 
 
 @gin.configurable
@@ -595,6 +675,13 @@ def train(
     best_validation_loss = float("inf")
     epochs_without_improvement = 0
 
+    # 결과 파일용 상태
+    best_epoch = 0
+    best_record: Optional[Dict[str, Any]] = None
+    epoch_records: list = []
+    stopped_early = False
+    training_start_time = time.time()
+
     save_dir.mkdir(
         parents=True,
         exist_ok=True,
@@ -608,6 +695,8 @@ def train(
     for epoch in range(1, num_epochs + 1):
         print()
         print(f"Epoch {epoch}/{num_epochs}")
+
+        epoch_start_time = time.time()
 
         # Train
         train_metrics = train_one_epoch(
@@ -645,6 +734,23 @@ def train(
         validation_loss = validation_metrics["total_loss"]
         validation_top1 = validation_metrics["top1_accuracy"]
 
+        # epoch 단위 기록
+        record: Dict[str, Any] = {
+            "epoch": epoch,
+            "epoch_seconds": round(
+                time.time() - epoch_start_time,
+                2,
+            ),
+        }
+
+        for key, value in validation_metrics.items():
+            record[f"val_{key}"] = value
+
+        for key, value in train_metrics.items():
+            record[f"train_{key}"] = value
+
+        epoch_records.append(record)
+
         # Every epoch checkpoint
         # 파라미터 탐색 중에는 save_every_epoch=False로 두어
         # epoch마다 쌓이는 checkpoint 용량을 없앤다.
@@ -666,6 +772,9 @@ def train(
             best_validation_top1 = validation_top1
             best_validation_loss = validation_loss
             epochs_without_improvement = 0
+
+            best_epoch = epoch
+            best_record = record
 
             save_checkpoint(
                 path=save_dir / "checkpoint_best.pt",
@@ -700,6 +809,7 @@ def train(
                 f"No validation Top-1 improvement for "
                 f"{early_stopping_patience} epochs."
             )
+            stopped_early = True
             break
 
     # Final checkpoint
@@ -716,6 +826,59 @@ def train(
         validation_top1_accuracy=validation_top1,
         include_optimizer=save_optimizer_state,
     )
+
+    # 결과 파일
+    # best epoch는 Validation Top-1 Accuracy 기준으로 선택된 epoch이며,
+    # 아래 지표들은 모두 그 epoch에서 측정된 값이다.
+    epochs_run = len(epoch_records)
+
+    history_path = save_dir / "epoch_history.csv"
+    write_epoch_history(history_path, epoch_records)
+
+    run_summary: Dict[str, Any] = {
+        "status": "SUCCESS",
+        "save_dir": str(save_dir),
+        "train_path": str(train_path),
+        "validation_path": str(validation_path),
+        "device": str(device),
+        "gpu": (
+            torch.cuda.get_device_name(0)
+            if device.type == "cuda"
+            else None
+        ),
+        "amp_enabled": amp_enabled,
+        "amp_dtype": (
+            str(resolved_amp_dtype).replace("torch.", "")
+            if amp_enabled
+            else None
+        ),
+        "seed": seed,
+        "total_parameters": int(total_parameters),
+        "trainable_parameters": int(trainable_parameters),
+        "num_epochs_configured": num_epochs,
+        "num_epochs_run": epochs_run,
+        "best_epoch": best_epoch,
+        "stopped_early": stopped_early,
+        "total_seconds": round(
+            time.time() - training_start_time,
+            2,
+        ),
+        "mean_epoch_seconds": (
+            round(
+                sum(r["epoch_seconds"] for r in epoch_records)
+                / epochs_run,
+                2,
+            )
+            if epochs_run > 0
+            else None
+        ),
+        "selection_metric": "val_top1_accuracy",
+        "best_metrics": best_record or {},
+        "gin_config": gin.config_str(),
+    }
+
+    summary_path = save_dir / "run_summary.json"
+    write_run_summary(summary_path, run_summary)
 
     print()
     print("Training Finished")
@@ -734,6 +897,14 @@ def train(
     print(
         "Final checkpoint:",
         final_checkpoint_path,
+    )
+    print(
+        "Run summary:",
+        summary_path,
+    )
+    print(
+        "Epoch history:",
+        history_path,
     )
 
 
