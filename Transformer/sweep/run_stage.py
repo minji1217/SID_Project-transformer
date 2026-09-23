@@ -6,39 +6,49 @@
 사람이 결과를 확인한 뒤 다음 단계로 넘어갈 수 있다.
 
     cd Transformer
-    python -m sweep.run_stage --config configs/transformer_mind.gin --stage 1
+    python -m sweep.run_stage --config configs/transformer_ebnerd.gin --stage 1
     # summary.csv 확인
-    python -m sweep.run_stage --config configs/transformer_mind.gin --stage 1 --accept-auto
-    python -m sweep.run_stage --config configs/transformer_mind.gin --stage 2
+    python -m sweep.run_stage --config configs/transformer_ebnerd.gin --stage 1 --accept-auto
+    python -m sweep.run_stage --config configs/transformer_ebnerd.gin --stage 2
 
 event_parameter_sweep/run_grid.py와 같은 원칙을 따른다.
   - 완료된 run은 _COMPLETE.json으로 표시하고 절대 덮어쓰지 않는다
   - 실패한 run의 폴더는 진단을 위해 남긴다
   - 같은 config는 다시 학습하지 않고 이전 결과를 재사용한다
+
+Test 데이터는 어떤 단계의 선택에도 사용하지 않는다.
+모든 판단은 Validation 지표로만 한다.
 """
 
 from __future__ import annotations
 
 import argparse
-import ast
 import csv
-import hashlib
 import json
-import re
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+from sweep.failures import build_failure_record
+from sweep.hashing import (
+    compute_config_hash,
+    file_sha256,
+    load_base_bindings,
+    source_fingerprint,
+)
 from sweep.selection import (
+    NotEnoughSuccessfulRuns,
     check_row_warnings,
     check_stage_warnings,
-    rank_rows,
+    select_stage_top_k,
 )
 from sweep.stages import (
     METRIC_PRIORITY,
     STAGES,
     get_stage,
+    is_final_stage,
     stage_dir_name,
 )
 
@@ -46,8 +56,14 @@ from sweep.stages import (
 BASE_DIR = Path(__file__).resolve().parent.parent
 TRAIN_SCRIPT = BASE_DIR / "train_transformer.py"
 
+COMPLETE_MARKER = "_COMPLETE.json"
+FAILED_MARKER = "_FAILED.json"
+
 # summary.csv에서 앞쪽에 보여줄 지표 (우선순위 순)
 METRIC_COLUMNS = [rule.key for rule in METRIC_PRIORITY]
+
+# summary.csv에 내보내지 않는 내부 값
+INTERNAL_COLUMNS = {"_params"}
 
 
 def format_gin_value(value: Any) -> str:
@@ -63,66 +79,6 @@ def format_gin_value(value: Any) -> str:
 
 def format_binding(key: str, value: Any) -> str:
     return f"{key} = {format_gin_value(value)}"
-
-
-# "Class.param = value" 형태의 gin binding 한 줄
-_BINDING_PATTERN = re.compile(
-    r"^\s*([A-Za-z_][\w]*\.[A-Za-z_][\w]*)\s*=\s*(.+?)\s*$"
-)
-
-
-def load_base_bindings(path: Path) -> Dict[str, Any]:
-    # 기준 config에 이미 들어 있는 값을 읽는다.
-    #
-    # 예를 들어 2단계의 max_history_length=20은 기준 config의 값과 같으므로
-    # 1단계에서 이미 학습한 config와 동일하다.
-    # 이런 경우를 같은 run으로 인식해 다시 학습하지 않기 위해 필요하다.
-    #
-    # 값을 읽지 못하는 줄은 건너뛴다. 그래도 동작에는 문제가 없고,
-    # 중복 제거가 조금 덜 될 뿐이다.
-    bindings: Dict[str, Any] = {}
-
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.split("#", 1)[0]
-
-        matched = _BINDING_PATTERN.match(line)
-
-        if matched is None:
-            continue
-
-        try:
-            bindings[matched.group(1)] = ast.literal_eval(
-                matched.group(2)
-            )
-        except (ValueError, SyntaxError):
-            continue
-
-    return bindings
-
-
-def strip_defaults(
-    bindings: Dict[str, Any],
-    base_bindings: Dict[str, Any],
-) -> Dict[str, Any]:
-    # 기준 config와 값이 같은 binding은 빼고 돌려준다.
-    # 학습에는 원래 binding을 그대로 넘기고,
-    # 이 결과는 run의 신원(hash)을 정할 때만 쓴다.
-    return {
-        key: value
-        for key, value in bindings.items()
-        if key not in base_bindings or base_bindings[key] != value
-    }
-
-
-def config_hash(bindings: Dict[str, Any]) -> str:
-    # 같은 설정이면 같은 폴더를 쓰게 해서 중복 학습을 막는다.
-    payload = json.dumps(
-        {key: bindings[key] for key in sorted(bindings)},
-        sort_keys=True,
-        default=str,
-    )
-
-    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
 
 
 def short_name(key: str) -> str:
@@ -141,7 +97,7 @@ def load_carried_configs(
     sweep_dir: Path,
     stage_number: int,
 ) -> List[Dict[str, Any]]:
-    # 1단계는 base config 그대로 시작한다
+    # 1단계는 기준 config 그대로 시작한다
     if stage_number == 1:
         return [{}]
 
@@ -167,28 +123,54 @@ def load_carried_configs(
     configs = payload.get("configs")
 
     if not configs:
-        raise ValueError(
-            f"{selected_path}에 configs가 비어 있습니다."
-        )
+        raise ValueError(f"{selected_path}에 configs가 비어 있습니다.")
 
     return configs
+
+
+def backup_run_dir(run_dir: Path) -> Path:
+    # 실패한 폴더를 지우지 않고 시각이 붙은 이름으로 옮긴다.
+    # 같은 오류가 반복되는지 나중에 비교할 수 있어야 한다.
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = run_dir.with_name(f"{run_dir.name}.failed.{timestamp}")
+
+    run_dir.rename(backup_path)
+
+    return backup_path
 
 
 def run_training(
     run_dir: Path,
     base_config: Path,
     bindings: Dict[str, Any],
-) -> None:
+    summary_extra: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
     # train_transformer.py를 별도 프로세스로 실행한다.
-    # gin은 전역 상태라 한 프로세스에서 여러 config를 연달아
-    # 적용하면 설정이 섞일 수 있어 run마다 프로세스를 분리한다.
+    #
+    # gin은 전역 상태라 한 프로세스에서 여러 config를 연달아 적용하면
+    # 설정이 섞인다. run마다 프로세스를 분리해야 안전하다.
+    #
+    # 성공하면 None, 실패하면 실패 기록을 돌려준다.
     run_dir.mkdir(parents=True, exist_ok=False)
+
+    extra_path = run_dir / "summary_extra.json"
+    extra_path.write_text(
+        json.dumps(summary_extra, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
+
+    (run_dir / "bindings.json").write_text(
+        json.dumps(bindings, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
 
     command = [
         sys.executable,
         str(TRAIN_SCRIPT),
         "--config",
         str(base_config),
+        "--summary-extra",
+        str(extra_path),
     ]
 
     for key in sorted(bindings):
@@ -198,11 +180,6 @@ def run_training(
         "--gin-binding",
         format_binding("train.save_dir", str(run_dir)),
     ]
-
-    (run_dir / "bindings.json").write_text(
-        json.dumps(bindings, ensure_ascii=False, indent=2, default=str),
-        encoding="utf-8",
-    )
 
     log_path = run_dir / "train_log.txt"
 
@@ -214,18 +191,21 @@ def run_training(
             stderr=subprocess.STDOUT,
         )
 
-    if process.returncode != 0:
-        # 실패한 폴더는 지우지 않는다.
-        # _COMPLETE.json이 없으므로 완료된 run과 구분된다.
-        raise RuntimeError(
-            f"학습이 실패했습니다 (exit code {process.returncode}).\n"
-            f"로그: {log_path}"
-        )
+    if process.returncode == 0 and (run_dir / "run_summary.json").exists():
+        return None
+
+    log_text = log_path.read_text(encoding="utf-8", errors="replace")
+
+    return build_failure_record(
+        log_text=log_text,
+        return_code=process.returncode,
+        log_path=str(log_path),
+    )
 
 
-def flatten_summary(
+def success_row(
     run_dir: Path,
-    bindings: Dict[str, Any],
+    params: Dict[str, Any],
     stage_name: str,
 ) -> Dict[str, Any]:
     summary = json.loads(
@@ -234,11 +214,12 @@ def flatten_summary(
 
     row: Dict[str, Any] = {
         "stage": stage_name,
+        "status": "SUCCESS",
         "config_hash": run_dir.name,
-        "config": describe(bindings) or "(base config)",
+        "config": describe(params) or "(base config)",
     }
 
-    for key, value in bindings.items():
+    for key, value in params.items():
         row[short_name(key)] = value
 
     for key in (
@@ -249,8 +230,10 @@ def flatten_summary(
         "total_seconds",
         "seed",
         "total_parameters",
+        "trainable_parameters",
         "amp_dtype",
         "gpu",
+        "base_config_sha256",
     ):
         row[key] = summary.get(key)
 
@@ -262,15 +245,38 @@ def flatten_summary(
     return row
 
 
+def failure_row(
+    run_dir: Path,
+    params: Dict[str, Any],
+    stage_name: str,
+    record: Dict[str, Any],
+) -> Dict[str, Any]:
+    row: Dict[str, Any] = {
+        "stage": stage_name,
+        "status": "FAILED",
+        "config_hash": run_dir.name,
+        "config": describe(params) or "(base config)",
+        "error_type": record.get("error_type"),
+        "return_code": record.get("return_code"),
+        "message": record.get("message"),
+        "log_path": record.get("log_path"),
+    }
+
+    for key, value in params.items():
+        row[short_name(key)] = value
+
+    return row
+
+
 def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
     if not rows:
         return
 
     # 지표를 앞쪽에 오게 열 순서를 정리한다
-    leading = ["rank", "stage", "config", "config_hash"]
-    trailing = ["warnings", "decision"]
+    leading = ["rank", "stage", "status", "config", "config_hash"]
+    trailing = ["error_type", "message", "log_path", "warnings", "decision"]
 
-    seen = set(leading) | set(trailing)
+    seen = set(leading) | set(trailing) | INTERNAL_COLUMNS
     middle: List[str] = []
 
     for key in METRIC_COLUMNS:
@@ -308,24 +314,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Transformer 단계별 파라미터 탐색",
     )
-    parser.add_argument(
-        "--config",
-        type=str,
-        required=True,
-        help="기준 gin config (예: configs/transformer_mind.gin)",
-    )
+    parser.add_argument("--config", type=str, required=True)
     parser.add_argument(
         "--stage",
         type=int,
         required=True,
         help=f"실행할 단계 번호 (1 ~ {len(STAGES)})",
     )
-    parser.add_argument(
-        "--out",
-        type=str,
-        default="sweep_out/default",
-        help="결과를 모아 둘 폴더",
-    )
+    parser.add_argument("--out", type=str, default="sweep_out/default")
     parser.add_argument(
         "--num-epochs",
         type=int,
@@ -338,11 +334,7 @@ def parse_args() -> argparse.Namespace:
         default=3,
         help="탐색용 early stopping patience (기본 3)",
     )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-    )
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--keep-optimizer-state",
         action="store_true",
@@ -351,16 +343,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--accept-auto",
         action="store_true",
-        help=(
-            "자동 선택 결과를 그대로 확정한다. "
-            "사람이 확인하지 않고 다음 단계로 넘어갈 때 사용한다."
-        ),
+        help="자동 선택 결과를 그대로 확정하고 다음 단계로 넘어간다.",
     )
     parser.add_argument(
-        "--dry-run",
+        "--fail-fast",
         action="store_true",
-        help="실행할 run 목록만 출력하고 학습은 하지 않는다.",
+        help="첫 실패에서 즉시 중단한다. 기본은 기록 후 계속 진행한다.",
     )
+    parser.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help=(
+            "이전에 실패한 run을 다시 실행한다. "
+            "기존 폴더는 지우지 않고 시각이 붙은 이름으로 옮긴다."
+        ),
+    )
+    parser.add_argument("--dry-run", action="store_true")
 
     return parser.parse_args()
 
@@ -369,13 +367,13 @@ def main() -> int:
     args = parse_args()
 
     stage = get_stage(args.stage)
-    sweep_dir = Path(args.out)
+    final_stage = is_final_stage(args.stage)
 
+    sweep_dir = Path(args.out)
     if not sweep_dir.is_absolute():
         sweep_dir = BASE_DIR / sweep_dir
 
     base_config = Path(args.config)
-
     if not base_config.is_absolute():
         base_config = BASE_DIR / base_config
 
@@ -387,6 +385,8 @@ def main() -> int:
     stage_dir = sweep_dir / stage_dir_name(args.stage)
 
     base_bindings = load_base_bindings(base_config)
+    base_sha256 = file_sha256(base_config)
+    fingerprint = source_fingerprint(BASE_DIR)
 
     # 탐색 예산과 저장 정책은 모든 run에 동일하게 적용한다
     budget_bindings: Dict[str, Any] = {
@@ -403,30 +403,44 @@ def main() -> int:
     print(f"Stage {args.stage}/{len(STAGES)}  {stage.name}")
     print("=" * 78)
     print(stage.description)
-    print(f"Base config : {base_config}")
-    print(f"Sweep dir   : {sweep_dir}")
+    print(f"Base config   : {base_config}")
+    print(f"Config SHA-256: {base_sha256[:16]}...")
+    print(f"Source        : {fingerprint['source_sha256']}", end="")
+    print(
+        f" (git {fingerprint['git_commit'][:8]}"
+        f"{'+dirty' if fingerprint['git_dirty'] else ''})"
+        if fingerprint["git_commit"]
+        else ""
+    )
+    print(f"Sweep dir     : {sweep_dir}")
     print(f"이어받은 config: {len(carried_configs)}개")
     print(f"이 단계 변형   : {len(stage.variants)}개")
     print(f"예정 run       : {len(carried_configs) * len(stage.variants)}개")
     print(f"탐색 예산      : 최대 {args.num_epochs} epoch, patience {args.patience}")
+    print(
+        f"다음 단계 유지 : 상위 {stage.top_k}개"
+        + ("  (Final Top-3)" if final_stage else "")
+    )
     print("=" * 78)
 
     planned: List[Dict[str, Any]] = []
 
     for carried in carried_configs:
         for variant in stage.variants:
-            bindings = dict(carried)
-            bindings.update(variant)
+            params = dict(carried)
+            params.update(variant)
 
-            full_bindings = dict(bindings)
+            full_bindings = dict(params)
             full_bindings.update(budget_bindings)
 
             planned.append(
                 {
-                    "params": bindings,
+                    "params": params,
                     "full": full_bindings,
-                    "hash": config_hash(
-                        strip_defaults(full_bindings, base_bindings)
+                    "hash": compute_config_hash(
+                        base_config_path=base_config,
+                        bindings=full_bindings,
+                        base_bindings=base_bindings,
                     ),
                 }
             )
@@ -434,48 +448,106 @@ def main() -> int:
     if args.dry_run:
         for index, item in enumerate(planned, 1):
             run_dir = runs_dir / item["hash"]
-            status = (
-                "재사용"
-                if (run_dir / "_COMPLETE.json").exists()
-                else "실행"
-            )
+
+            if (run_dir / COMPLETE_MARKER).exists():
+                status = "재사용"
+            elif (run_dir / FAILED_MARKER).exists():
+                status = "재시도" if args.retry_failed else "실패기록"
+            else:
+                status = "실행"
+
             print(f"{index:>3}. [{status}] {describe(item['params'])}")
+
+        print()
+        print(f"총 {len(planned)}개")
         return 0
 
     rows: List[Dict[str, Any]] = []
+    params_by_hash: Dict[str, Dict[str, Any]] = {}
 
     for index, item in enumerate(planned, 1):
         run_dir = runs_dir / item["hash"]
-        complete_marker = run_dir / "_COMPLETE.json"
+        params_by_hash[item["hash"]] = item["params"]
+
+        complete_marker = run_dir / COMPLETE_MARKER
+        failed_marker = run_dir / FAILED_MARKER
 
         print()
         print("-" * 78)
         print(f"[{index}/{len(planned)}] {describe(item['params'])}")
 
+        # 이전에 실패한 run을 다시 돌리는 경우
+        if args.retry_failed and run_dir.exists() and not complete_marker.exists():
+            backup_path = backup_run_dir(run_dir)
+            print(f"이전 실패 결과를 보관했습니다: {backup_path.name}")
+
         if complete_marker.exists():
             print(f"이미 완료된 config라 재사용합니다: {run_dir.name}")
+            rows.append(success_row(run_dir, item["params"], stage.name))
+            continue
 
-        elif run_dir.exists():
+        if failed_marker.exists():
+            record = json.loads(failed_marker.read_text(encoding="utf-8"))
             print(
-                "완료 표시가 없는 폴더가 이미 있습니다. "
-                "덮어쓰지 않고 중단합니다.\n"
-                f"경로: {run_dir}\n"
-                "이전 실행이 실패한 흔적이라면 폴더를 확인하고 직접 지우세요."
+                f"이전에 실패한 run입니다 ({record.get('error_type')}). "
+                "다시 돌리려면 --retry-failed를 쓰세요."
             )
-            return 1
+            rows.append(
+                failure_row(run_dir, item["params"], stage.name, record)
+            )
+            continue
 
-        else:
-            run_training(
-                run_dir=run_dir,
-                base_config=base_config,
-                bindings=item["full"],
+        if run_dir.exists():
+            # 완료 표시도 실패 표시도 없는 폴더.
+            # 학습 도중에 중단된 흔적이므로 덮어쓰지 않는다.
+            record = {
+                "status": "FAILED",
+                "error_type": "UNKNOWN",
+                "return_code": None,
+                "message": (
+                    "완료 표시가 없는 폴더가 이미 존재합니다. "
+                    "학습 도중 중단된 것으로 보입니다."
+                ),
+                "log_path": str(run_dir / "train_log.txt"),
+            }
+            failed_marker.write_text(
+                json.dumps(record, ensure_ascii=False, indent=2),
+                encoding="utf-8",
             )
 
+            print(f"완료 표시가 없는 폴더입니다: {run_dir}")
+
+            if args.fail_fast:
+                return 1
+
+            rows.append(
+                failure_row(run_dir, item["params"], stage.name, record)
+            )
+            continue
+
+        summary_extra = {
+            "config_hash": item["hash"],
+            "stage": stage.name,
+            "stage_number": args.stage,
+            "source_fingerprint": fingerprint,
+        }
+
+        record = run_training(
+            run_dir=run_dir,
+            base_config=base_config,
+            bindings=item["full"],
+            summary_extra=summary_extra,
+        )
+
+        if record is None:
             complete_marker.write_text(
                 json.dumps(
                     {
                         "status": "SUCCESS",
                         "stage": stage.name,
+                        "config_hash": item["hash"],
+                        "base_config_sha256": base_sha256,
+                        "source_fingerprint": fingerprint,
                         "bindings": item["full"],
                     },
                     ensure_ascii=False,
@@ -486,40 +558,83 @@ def main() -> int:
             )
 
             print(f"완료: {run_dir.name}")
+            rows.append(success_row(run_dir, item["params"], stage.name))
+            continue
 
-        row = flatten_summary(
-            run_dir=run_dir,
-            bindings=item["params"],
-            stage_name=stage.name,
+        # 실패
+        failed_marker.write_text(
+            json.dumps(record, ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
-        row["_params"] = item["params"]
-        rows.append(row)
+
+        print(f"실패 [{record['error_type']}]: {record['message']}")
+        print(f"로그: {record['log_path']}")
+
+        if args.fail_fast:
+            print("--fail-fast가 지정되어 중단합니다.")
+            write_csv(
+                stage_dir / "summary.csv",
+                rows + [failure_row(run_dir, item["params"], stage.name, record)],
+            )
+            return 1
+
+        print("나머지 run을 계속 진행합니다.")
+        rows.append(failure_row(run_dir, item["params"], stage.name, record))
 
     # 선택
-    ordered = rank_rows(rows)
-    winner = ordered[0][0]
+    summary_path = stage_dir / "summary.csv"
+
+    try:
+        ordered, failed_rows, selected_rows = select_stage_top_k(
+            rows,
+            stage.top_k,
+        )
+
+    except NotEnoughSuccessfulRuns as error:
+        # 순위를 매길 수 없어도 무엇이 실패했는지는 남긴다
+        for row in rows:
+            row["warnings"] = " | ".join(check_row_warnings(row))
+
+        write_csv(summary_path, rows)
+
+        print()
+        print("=" * 78)
+        print("자동 선택을 할 수 없습니다.")
+        print("=" * 78)
+        print(error)
+        print()
+        print(f"요약 CSV: {summary_path}")
+        return 1
 
     for position, (row, trace) in enumerate(ordered, 1):
         row["rank"] = position
         row["decision"] = " | ".join(trace)
         row["warnings"] = " | ".join(check_row_warnings(row))
 
-    stage_warnings = check_stage_warnings(rows, winner)
+    for row in failed_rows:
+        row["rank"] = None
+        row["warnings"] = "실패한 run이라 순위 선정에서 제외됨"
 
-    summary_path = stage_dir / "summary.csv"
-    write_csv(summary_path, [row for row, _ in ordered])
+    stage_warnings = check_stage_warnings(
+        [row for row, _ in ordered],
+        ordered[0][0],
+    )
+
+    write_csv(summary_path, [row for row, _ in ordered] + failed_rows)
 
     selected = [
-        row["_params"]
-        for row, _ in ordered[: stage.top_k]
+        params_by_hash[row["config_hash"]]
+        for row in selected_rows
     ]
 
-    auto_payload = {
+    auto_payload: Dict[str, Any] = {
         "stage": args.stage,
         "stage_name": stage.name,
         "top_k": stage.top_k,
+        "is_final_stage": final_stage,
         "configs": selected,
         "stage_warnings": stage_warnings,
+        "failed_run_count": len(failed_rows),
         "note": (
             "이 파일은 자동 선택 결과입니다. "
             "확정하려면 selected.json으로 복사하세요."
@@ -550,6 +665,12 @@ def main() -> int:
         if row.get("warnings"):
             print(f"      [경고] {row['warnings']}")
 
+    if failed_rows:
+        print()
+        print(f"실패한 run {len(failed_rows)}개 (순위 선정 제외):")
+        for row in failed_rows:
+            print(f"  - [{row.get('error_type')}] {row['config']}")
+
     if stage_warnings:
         print()
         print("단계 경고:")
@@ -568,14 +689,29 @@ def main() -> int:
             encoding="utf-8",
         )
         print(f"확정 완료   : {selected_path}")
-        print(f"다음: python -m sweep.run_stage --config {args.config} --stage {args.stage + 1}")
+
+        if final_stage:
+            print()
+            print("마지막 단계입니다. Final Top-3로 seed 검증을 실행하세요:")
+            print(
+                f"  python -m sweep.run_seed_robustness "
+                f"--config {args.config} --sweep-out {args.out} "
+                f"--seeds 42 123 2026 --num-epochs 30 --patience 5"
+            )
+        else:
+            print(
+                f"다음: python -m sweep.run_stage --config {args.config} "
+                f"--stage {args.stage + 1} --out {args.out}"
+            )
 
     else:
         print()
         print("summary.csv를 확인한 뒤 다음 중 하나를 하세요:")
-        print(f"  1) 자동 선택 그대로 확정: 같은 명령에 --accept-auto 추가")
-        print(f"  2) 직접 고르기: selected_auto.json을 편집해 "
-              f"{selected_path.name}으로 저장")
+        print("  1) 자동 선택 그대로 확정: 같은 명령에 --accept-auto 추가")
+        print(
+            f"  2) 직접 고르기: selected_auto.json을 편집해 "
+            f"{selected_path.name}으로 저장"
+        )
 
     return 0
 

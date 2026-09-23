@@ -1,17 +1,16 @@
 """
 단계별 파라미터 탐색의 정의.
 
-전체 조합을 다 도는 grid search는 96,768가지라 불가능하다.
-  4(lr) x 7(d_model,num_heads) x 3(num_layers) x 4(dropout)
-  x 4(max_history) x 3(batch_size) x 4(d_ff) x 3(weight_decay) x 2(use_sep)
+전체 조합을 다 도는 grid search는 불가능하다.
+  4(max_history) x 2(use_sep) x 7(d_model,num_heads) x 3(num_layers)
+  x 4(d_ff) x 4(lr) x 3(batch) x 4(dropout) x 3(weight_decay)
+  = 96,768 가지
 
-대신 영향이 큰 파라미터부터 순서대로 탐색하고,
-각 단계에서 상위 top_k개를 고정한 뒤 다음 단계로 넘어간다 (총 62 run).
+대신 서로 강하게 얽힌 파라미터를 같은 단계에서 함께 탐색하고,
+각 단계에서 상위 2개 branch를 다음 단계로 넘긴다.
+마지막 단계에서는 seed 검증용으로 Final Top-3를 남긴다.
 
-각 단계에서 이전 단계가 남긴 config를 그대로 이어받기 때문에,
-단계 순서가 결과에 영향을 준다.
-그래서 영향이 크다고 알려진 learning_rate와 max_history_length를 앞에 두고,
-top_k=2로 두 갈래를 들고 가서 한 번의 잘못된 선택으로 전체가 틀어지지 않게 한다.
+중복 제거 전 기준 총 84 run이다.
 """
 
 from __future__ import annotations
@@ -22,7 +21,7 @@ from typing import Any, Dict, List, NamedTuple
 # ---------------------------------------------------------------- 지표 우선순위
 #
 # 단계별로 상위 config를 고를 때 이 순서대로 본다.
-# 앞 지표의 차이가 tolerance 이내면 "동률"로 보고 다음 지표로 내려간다.
+# 앞 지표의 최고값과 tolerance 이내인 후보만 다음 지표로 내려간다.
 #
 # tolerance가 0이면 사실상 1순위 지표만 쓰이게 된다.
 # Top-1 Accuracy는 (맞힌 수 / 전체)라 값이 촘촘해서
@@ -31,10 +30,15 @@ from typing import Any, Dict, List, NamedTuple
 # 기본값 근거:
 #   validation 5만 건, Top-1이 0.3 근처일 때
 #   순수 표본오차(binomial standard error)는 약 0.002이다.
-#   seed에 따른 변동은 그보다 크므로 그 2배 정도인 0.005를 기본값으로 둔다.
+#   seed에 따른 변동은 그보다 크므로 그 2배인 0.005를 기본값으로 둔다.
 #
 # 실제 seed 실험으로 표준편차를 측정했다면 그 값으로 바꾼다.
 # (sweep/DECISION_RULE.md 참고)
+#
+# 선정 우선순위에 넣지 않는 지표:
+#   total_loss      lambda_preference=1이라 preference_loss와 값이 같다
+#   negative_prob   positive_prob에서 계산되므로 구조적으로 중복이다
+#   nDCG@10         후보가 5개라 nDCG@5와 항상 같은 값이다
 
 class MetricRule(NamedTuple):
     key: str
@@ -60,9 +64,26 @@ class Stage(NamedTuple):
     name: str
     description: str
     # 각 variant는 이 단계에서 시도할 gin binding 묶음이다.
-    # d_model과 num_heads처럼 서로 얽힌 파라미터는 한 variant에 함께 넣는다.
+    # 서로 얽힌 파라미터는 한 variant에 함께 넣어 Cartesian product로 탐색한다.
     variants: List[Dict[str, Any]]
     top_k: int
+
+
+def _product(
+    first_binding: str,
+    first_values: List[Any],
+    second_binding: str,
+    second_values: List[Any],
+) -> List[Dict[str, Any]]:
+    # 두 파라미터의 Cartesian product
+    return [
+        {
+            first_binding: first_value,
+            second_binding: second_value,
+        }
+        for first_value in first_values
+        for second_value in second_values
+    ]
 
 
 def _single(binding: str, values: List[Any]) -> List[Dict[str, Any]]:
@@ -72,9 +93,9 @@ def _single(binding: str, values: List[Any]) -> List[Dict[str, Any]]:
 # d_model과 num_heads는 함께 정해야 한다.
 # modules/model.py가 d_model % num_heads != 0이면 ValueError를 던지므로
 # 3 x 3 = 9쌍 중 유효한 7쌍만 남긴다.
-#   256: 4, 8      (6은 나누어떨어지지 않음)
+#   256: 4, 8      (256 % 6 != 0)
 #   384: 4, 6, 8
-#   512: 4, 8      (6은 나누어떨어지지 않음)
+#   512: 4, 8      (512 % 6 != 0)
 _ARCH_VARIANTS: List[Dict[str, Any]] = [
     {
         "NewsEncoderDecoderTransformer.d_model": d_model,
@@ -88,28 +109,24 @@ _ARCH_VARIANTS: List[Dict[str, Any]] = [
 
 STAGES: List[Stage] = [
     Stage(
-        name="learning_rate",
-        description="학습률. 영향이 가장 커서 가장 먼저 정한다.",
-        variants=_single(
-            "train.learning_rate",
-            [0.00005, 0.0001, 0.0002, 0.0005],
+        name="max_history_use_sep",
+        description=(
+            "입력 길이 구조. history 길이와 SEP 토큰 사용 여부는 "
+            "encoder 입력 시퀀스를 함께 결정하므로 같은 단계에서 탐색한다."
         ),
-        top_k=2,
-    ),
-    Stage(
-        name="max_history_length",
-        description="사용할 최근 기사 수. 입력 길이가 바뀌어 영향이 크다.",
-        variants=_single(
+        variants=_product(
             "NewsSequenceDataset.max_history_length",
             [10, 20, 30, 50],
+            "NewsEncoderDecoderTransformer.use_sep",
+            [True, False],
         ),
         top_k=2,
     ),
     Stage(
         name="d_model_num_heads",
         description=(
-            "임베딩 차원과 attention head 수. "
-            "d_model % num_heads != 0이면 모델이 에러를 내므로 함께 탐색한다."
+            "attention 폭과 head 수. d_model % num_heads != 0이면 "
+            "모델이 에러를 내므로 유효한 7쌍만 함께 탐색한다."
         ),
         variants=_ARCH_VARIANTS,
         top_k=2,
@@ -133,43 +150,33 @@ STAGES: List[Stage] = [
         top_k=2,
     ),
     Stage(
-        name="dropout",
-        description="dropout 비율. 앞 단계에서 정해진 모델 크기에 맞춰 조절한다.",
-        variants=_single(
-            "NewsEncoderDecoderTransformer.dropout_rate",
-            [0.0, 0.1, 0.2, 0.3],
-        ),
-        top_k=2,
-    ),
-    Stage(
-        name="weight_decay",
-        description="정규화 강도. dropout과 함께 과적합을 조절한다.",
-        variants=_single(
-            "train.weight_decay",
-            [0.0, 0.01, 0.05],
-        ),
-        top_k=2,
-    ),
-    Stage(
-        name="batch_size",
+        name="learning_rate_batch_size",
         description=(
-            "batch 크기. learning_rate와 얽혀 있어 뒤쪽에 둔다. "
-            "여기서부터는 갈래를 하나로 좁힌다."
+            "학습률과 batch 크기. 두 값은 학습 dynamics가 연결되어 있어 "
+            "따로 정하면 잘못된 조합에 빠지므로 Cartesian product로 탐색한다."
         ),
-        variants=_single(
+        variants=_product(
+            "train.learning_rate",
+            [0.00005, 0.0001, 0.0002, 0.0005],
             "train.batch_size",
             [64, 128, 256],
         ),
-        top_k=1,
+        top_k=2,
     ),
     Stage(
-        name="use_sep",
-        description="history 기사 사이 SEP 토큰 사용 여부. ablation 성격.",
-        variants=_single(
-            "NewsEncoderDecoderTransformer.use_sep",
-            [True, False],
+        name="dropout_weight_decay",
+        description=(
+            "정규화 강도. dropout과 weight decay는 함께 과적합을 조절하므로 "
+            "Cartesian product로 탐색한다. "
+            "마지막 단계이므로 seed 검증용 Final Top-3를 남긴다."
         ),
-        top_k=1,
+        variants=_product(
+            "NewsEncoderDecoderTransformer.dropout_rate",
+            [0.0, 0.1, 0.2, 0.3],
+            "train.weight_decay",
+            [0.0, 0.01, 0.05],
+        ),
+        top_k=3,
     ),
 ]
 
@@ -188,6 +195,10 @@ def get_stage(stage_number: int) -> Stage:
 def stage_dir_name(stage_number: int) -> str:
     stage = get_stage(stage_number)
     return f"stage_{stage_number:02d}_{stage.name}"
+
+
+def is_final_stage(stage_number: int) -> bool:
+    return stage_number == len(STAGES)
 
 
 def total_run_estimate() -> int:

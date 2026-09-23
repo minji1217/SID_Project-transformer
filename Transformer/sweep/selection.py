@@ -16,6 +16,14 @@ from typing import Any, Dict, List, Optional, Tuple
 from sweep.stages import METRIC_PRIORITY, MetricRule
 
 
+STATUS_SUCCESS = "SUCCESS"
+STATUS_FAILED = "FAILED"
+
+
+class NotEnoughSuccessfulRuns(RuntimeError):
+    """성공한 run이 top_k보다 적어 자동 선택을 할 수 없는 경우."""
+
+
 # 후보 5개 중 정답 1개이므로 아무것도 학습하지 못한 모델의 기댓값
 RANDOM_TOP1 = 0.2
 RANDOM_AUC = 0.5
@@ -74,13 +82,20 @@ def _within_tolerance(
 
 def pick_winner(
     rows: List[Dict[str, Any]],
+    rules: Optional[List[MetricRule]] = None,
 ) -> Tuple[Dict[str, Any], List[str]]:
     # 지표 우선순위를 따라 내려가며 후보를 좁힌다.
     # 어느 지표에서 승부가 났는지도 함께 돌려준다.
+    #
+    # rules를 넘기면 다른 우선순위를 쓸 수 있다.
+    # seed 검증에서는 지표 평균과 표준편차로 비교해야 하므로 필요하다.
+    if rules is None:
+        rules = METRIC_PRIORITY
+
     pool = list(rows)
     trace: List[str] = []
 
-    for rule in METRIC_PRIORITY:
+    for rule in rules:
         if len(pool) <= 1:
             break
 
@@ -128,13 +143,14 @@ def pick_winner(
 
 def rank_rows(
     rows: List[Dict[str, Any]],
+    rules: Optional[List[MetricRule]] = None,
 ) -> List[Tuple[Dict[str, Any], List[str]]]:
     # 1등을 뽑아 빼내는 것을 반복해 전체 순위를 만든다.
     remaining = list(rows)
     ordered: List[Tuple[Dict[str, Any], List[str]]] = []
 
     while remaining:
-        winner, trace = pick_winner(remaining)
+        winner, trace = pick_winner(remaining, rules=rules)
         ordered.append((winner, trace))
         remaining = [row for row in remaining if row is not winner]
 
@@ -242,3 +258,50 @@ def check_stage_warnings(
             )
 
     return warnings
+
+
+def is_successful(row: Dict[str, Any]) -> bool:
+    return str(row.get("status", "")).upper() == STATUS_SUCCESS
+
+
+def split_by_status(
+    rows: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    # 실패한 run은 순위 선정에서 제외한다.
+    # 성능이 나빠서가 아니라 측정 자체가 안 된 것이므로
+    # 다른 run과 같은 기준으로 비교할 수 없다.
+    successful = [row for row in rows if is_successful(row)]
+    failed = [row for row in rows if not is_successful(row)]
+
+    return successful, failed
+
+
+def select_stage_top_k(
+    rows: List[Dict[str, Any]],
+    top_k: int,
+) -> Tuple[
+    List[Tuple[Dict[str, Any], List[str]]],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+]:
+    # 단계 결과에서 상위 top_k개를 고른다.
+    #
+    # 돌려주는 값:
+    #   ordered  성공한 run의 순위와 판단 근거
+    #   failed   실패한 run
+    #   selected 다음 단계로 넘길 상위 top_k개
+    successful, failed = split_by_status(rows)
+
+    if len(successful) < top_k:
+        raise NotEnoughSuccessfulRuns(
+            f"성공한 run이 {len(successful)}개뿐이라 "
+            f"상위 {top_k}개를 고를 수 없습니다. "
+            f"(실패 {len(failed)}개)\n"
+            "실패한 run의 _FAILED.json과 train_log.txt를 확인한 뒤 "
+            "--retry-failed로 다시 실행하세요."
+        )
+
+    ordered = rank_rows(successful)
+    selected = [row for row, _ in ordered[:top_k]]
+
+    return ordered, failed, selected

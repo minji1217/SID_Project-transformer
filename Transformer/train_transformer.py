@@ -20,8 +20,20 @@ from evaluate.ranking import compute_ranking_metrics
 from modules.model import NewsEncoderDecoderTransformer
 from modules.loss import TransformerLoss
 
+try:
+    # run_summary.json에 기준 config의 지문과 적용된 설정을 남기기 위해 쓴다.
+    # sweep 폴더가 없어도 학습 자체는 동작해야 하므로 실패를 허용한다.
+    from sweep.hashing import file_sha256, parse_gin_bindings
+except ImportError:
+    file_sha256 = None
+    parse_gin_bindings = None
+
 
 BASE_DIR = Path(__file__).resolve().parent
+
+# main()이 채우고 train()이 run_summary.json에 그대로 넣는다.
+# 어떤 config와 어떤 override로 돌린 결과인지 파일만 보고 알 수 있게 한다.
+RUN_CONTEXT: Dict[str, Any] = {}
 
 
 def set_seed(seed: int) -> None:
@@ -874,8 +886,21 @@ def train(
         ),
         "selection_metric": "val_top1_accuracy",
         "best_metrics": best_record or {},
+        "base_config_path": RUN_CONTEXT.get("base_config_path"),
+        "base_config_sha256": RUN_CONTEXT.get("base_config_sha256"),
+        "config_hash": RUN_CONTEXT.get("config_hash"),
+        "gin_overrides": RUN_CONTEXT.get("gin_overrides", []),
+        "effective_bindings": (
+            parse_gin_bindings(gin.config_str())
+            if parse_gin_bindings is not None
+            else None
+        ),
         "gin_config": gin.config_str(),
     }
+
+    # sweep이 넘겨준 추가 정보(stage 이름, 소스 지문 등)
+    for key, value in RUN_CONTEXT.get("extra", {}).items():
+        run_summary.setdefault(key, value)
 
     summary_path = save_dir / "run_summary.json"
     write_run_summary(summary_path, run_summary)
@@ -933,6 +958,14 @@ def main() -> None:
         metavar="BINDING",
     )
 
+    # sweep이 run_summary.json에 추가로 남기고 싶은 값을 담은 JSON 파일
+    parser.add_argument(
+        "--summary-extra",
+        type=str,
+        default=None,
+        metavar="JSON_PATH",
+    )
+
     args = parser.parse_args()
 
     config_path = resolve_path(
@@ -948,6 +981,25 @@ def main() -> None:
         "Gin config:",
         config_path,
     )
+
+    # run_summary.json에 남길 실행 맥락
+    RUN_CONTEXT["base_config_path"] = str(config_path)
+    RUN_CONTEXT["gin_overrides"] = list(args.gin_binding)
+
+    if file_sha256 is not None:
+        RUN_CONTEXT["base_config_sha256"] = file_sha256(config_path)
+
+    if args.summary_extra:
+        extra_path = resolve_path(args.summary_extra)
+
+        if not extra_path.exists():
+            raise FileNotFoundError(
+                f"summary-extra file not found:\n{extra_path}"
+            )
+
+        extra = json.loads(extra_path.read_text(encoding="utf-8"))
+        RUN_CONTEXT["config_hash"] = extra.pop("config_hash", None)
+        RUN_CONTEXT["extra"] = extra
 
     gin.parse_config_file(
         str(config_path)

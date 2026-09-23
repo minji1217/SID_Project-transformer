@@ -230,6 +230,18 @@ def main() -> None:
     parser.add_argument("--output_path", type=str, default="out/transformer/ebnerd/test_candidate_scores.parquet")
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--num_workers", type=int, default=0)
+
+    # 최종 설정으로 학습한 checkpoint를 불러오려면
+    # 모델 구조가 학습 때와 같아야 한다.
+    # 예: --gin-binding "NewsEncoderDecoderTransformer.d_model = 512"
+    parser.add_argument(
+        "--gin-binding",
+        type=str,
+        action="append",
+        default=[],
+        metavar="BINDING",
+    )
+
     args = parser.parse_args()
 
     # Path
@@ -250,6 +262,15 @@ def main() -> None:
 
     # Gin
     gin.parse_config_file(str(config_path), skip_unknown=True)
+
+    # config 파일을 먼저 읽고, 그 뒤에 덮어쓴다.
+    if args.gin_binding:
+        print("Gin overrides:")
+
+        for binding in args.gin_binding:
+            print("  ", binding)
+
+        gin.parse_config(args.gin_binding, skip_unknown=True)
 
     # Device
     device = get_device()

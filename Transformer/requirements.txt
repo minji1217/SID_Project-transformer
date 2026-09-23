@@ -1,0 +1,19 @@
+# PyTorch는 여기에 넣지 않는다.
+#
+# GPU와 CUDA 버전에 맞는 빌드를 공식 안내에 따라 먼저 설치해야 한다.
+#   https://pytorch.org/get-started/locally/
+# 예 (CUDA 12.1):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+#
+# PyTorch를 설치한 뒤에 이 파일을 설치한다.
+#   pip install -r requirements.txt
+
+transformers
+gin-config
+numpy
+pandas
+pyarrow
+
+# split_validation.py에서만 사용한다.
+# validation을 validation/test로 나누지 않는다면 없어도 된다.
+polars
