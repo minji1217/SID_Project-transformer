@@ -166,7 +166,17 @@ def check_dataset(
     full: bool,
 ) -> None:
     if not path.exists():
-        report.fail(f"{label} 파일", f"찾을 수 없습니다: {path}")
+        hint = ""
+
+        # 상대경로인데 datasets 링크가 없으면 그것이 원인일 가능성이 높다
+        if not (BASE_DIR / "datasets").exists():
+            hint = (
+                "\n           datasets 링크가 없습니다. "
+                "ln -s ~/shared/datasets "
+                f"{BASE_DIR / 'datasets'}"
+            )
+
+        report.fail(f"{label} 파일", f"찾을 수 없습니다: {path}{hint}")
         return
 
     report.ok(f"{label} 파일", str(path))
@@ -282,6 +292,39 @@ def check_dataset(
                 f"{label} {column}",
                 f"{scope} 범위 [{observed_min}, {observed_max}] < {vocab_size}",
             )
+
+
+def check_datasets_link(report: Report) -> None:
+    # 공용 서버에서는 데이터를 각자 폴더에 복사하지 않고
+    # Transformer/datasets를 공용 폴더로 연결해서 쓴다.
+    #
+    # 링크가 없으면 gin의 상대경로가 풀리지 않는다.
+    # "파일을 찾을 수 없습니다"만 보고는 원인을 알기 어려우므로
+    # 링크 상태를 따로 알려준다.
+    link = BASE_DIR / "datasets"
+
+    if link.is_symlink():
+        target = link.resolve()
+
+        if target.exists():
+            report.ok("datasets 링크", f"-> {target}")
+        else:
+            report.fail(
+                "datasets 링크",
+                f"링크가 가리키는 곳이 없습니다: {target}",
+            )
+
+        return
+
+    if link.is_dir():
+        report.ok("datasets 폴더", f"{link} (링크가 아닌 실제 폴더)")
+        return
+
+    report.warn(
+        "datasets",
+        f"{link}가 없습니다. gin이 상대경로를 쓴다면 아래를 실행하세요:\n"
+        f"           ln -s ~/shared/datasets {link}",
+    )
 
 
 def check_architecture(report: Report, bindings: Dict[str, Any]) -> None:
@@ -507,6 +550,8 @@ def main() -> int:
     }
 
     report.section("4~8. 데이터")
+
+    check_datasets_link(report)
 
     for label, binding_key in (
         ("Train", "train.train_path"),

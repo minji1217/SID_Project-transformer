@@ -310,15 +310,22 @@ seed가 모자란 설정은 `config_aggregate.csv`에 남기되 순위에서 제
 
 ## 9. 데이터 경로
 
-gin config는 `~` 표기를 쓴다.
+gin config는 `Transformer/` 기준 상대경로를 쓴다.
 
 ```
-train.train_path      = "~/shared/datasets/ebnerd/train_sequences_1pos4neg.parquet"
-train.validation_path = "~/shared/datasets/ebnerd/validation_sequences_1pos4neg_half.parquet"
+train.train_path      = "datasets/ebnerd/train_sequences_1pos4neg.parquet"
+train.validation_path = "datasets/ebnerd/validation_sequences_1pos4neg_half.parquet"
 ```
 
-`~`는 로그인 사용자의 홈 디렉터리로 풀리므로, 계정이 `ubuntu`든 `ec2-user`든
-같은 config가 그대로 동작한다. 절대경로를 적어도 된다.
+공용 서버에서는 데이터를 각자 폴더에 복사하지 않고 링크로 연결한다.
+
+```bash
+ln -s ~/shared/datasets ~/<본인이름>/<repo>/Transformer/datasets
+```
+
+`split_validation.py`와 `predict_sid.py`도 같은 상대경로를 쓰므로
+이 링크 하나로 모든 스크립트가 같은 데이터를 본다.
+절대경로나 `~` 표기를 gin에 직접 적어도 동작한다.
 
 서버 배치:
 
@@ -339,7 +346,8 @@ train.validation_path = "~/shared/datasets/ebnerd/validation_sequences_1pos4neg_
         └── test_sequences_1pos4neg.parquet
 ```
 
-`validation_..._half.parquet`와 `test_...parquet`는 `split_validation.py`가 만든다.
-MIND에는 test가 없으므로 최종 Test 평가는 EB-NeRD에서만 한다.
+`validation_..._half.parquet`와 `test_...parquet`는 `split_validation.py`가
+원본 validation을 impression 시간순 50:50으로 나누어 만든다.
+EB-NeRD 공식 데이터는 test 정답을 공개하지 않으므로 이렇게 만든다.
 
 실제로 어느 경로를 보고 있는지는 `sweep.preflight`가 출력한다.

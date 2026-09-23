@@ -12,24 +12,35 @@
 
 ---
 
-## 데이터 경로
+## 데이터 경로 — 먼저 심볼릭 링크를 건다
 
-gin config는 `~` 표기를 쓴다. 로그인 사용자가 `ubuntu`든 `ec2-user`든
-같은 config가 동작한다.
+gin config는 `datasets/<이름>/...` 상대경로를 쓴다.
+공용 서버에서는 데이터를 각자 폴더에 복사하지 않고 링크로 연결한다.
+
+```bash
+ln -s ~/shared/datasets ~/<본인이름>/<repo>/Transformer/datasets
+```
+
+**이 링크 하나가 없으면 아무것도 돌아가지 않는다.**
+`split_validation.py`와 `predict_sid.py`도 같은 상대경로를 쓰기 때문이다.
 
 ```
 ~/shared/
 ├── raw/          공통 전처리 산출물
-└── datasets/     Transformer 입력 ← gin config가 보는 위치
-    ├── mind/     train / validation / validation_half
-    └── ebnerd/   train / validation / validation_half / test
+└── datasets/     Transformer 입력
+    ├── mind/     train / validation_half / test
+    └── ebnerd/   train / validation_half / test
+                        ↑
+   Transformer/datasets ─┘  (심볼릭 링크)
 ```
 
-경로가 다르면 `configs/transformer_ebnerd.gin`의
-`train.train_path`와 `train.validation_path`를 고친다.
-실제로 어느 경로를 보고 있는지는 `sweep.preflight`가 출력한다.
+링크 상태와 실제로 보고 있는 경로는 `sweep.preflight`가 출력한다.
+링크가 없으면 만들 명령까지 같이 알려준다.
 
-MIND에는 test 파일이 없으므로 최종 Test 평가는 EB-NeRD에서만 한다.
+절대경로나 `~/shared/datasets/...` 표기를 gin에 직접 적어도 동작한다.
+다만 위 두 스크립트를 위해 링크는 어차피 필요하다.
+
+`Transformer/datasets`는 `.gitignore`에 들어 있어 커밋되지 않는다.
 
 ---
 

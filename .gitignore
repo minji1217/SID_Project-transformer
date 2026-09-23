@@ -1,6 +1,9 @@
-RQVAE/datasets/
-RQVAE/out/
-Transformer/datasets/
+# 데이터 폴더.
+# 공용 서버에서는 심볼릭 링크로 연결하므로 슬래시 없이 적는다.
+# 슬래시를 붙이면 폴더만 매칭되어 링크가 걸러지지 않는다.
+RQVAE/datasets
+RQVAE/out
+Transformer/datasets
 
 *.npy
 *.parquet

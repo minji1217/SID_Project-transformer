@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--test-path",
         type=str,
-        default="~/shared/datasets/ebnerd/test_sequences_1pos4neg.parquet",
+        default="datasets/ebnerd/test_sequences_1pos4neg.parquet",
     )
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=0)
