@@ -18,7 +18,8 @@ BASE_DIR = Path(__file__).resolve().parent
 
 
 def resolve_path(path: str) -> Path:
-    path_obj = Path(path)
+    # "~/shared/datasets/..." 표기를 지원한다
+    path_obj = Path(path).expanduser()
     return path_obj if path_obj.is_absolute() else BASE_DIR / path_obj
 
 

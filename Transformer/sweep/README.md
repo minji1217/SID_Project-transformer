@@ -12,6 +12,27 @@
 
 ---
 
+## 데이터 경로
+
+gin config는 `~` 표기를 쓴다. 로그인 사용자가 `ubuntu`든 `ec2-user`든
+같은 config가 동작한다.
+
+```
+~/shared/
+├── raw/          공통 전처리 산출물
+└── datasets/     Transformer 입력 ← gin config가 보는 위치
+    ├── mind/     train / validation / validation_half
+    └── ebnerd/   train / validation / validation_half / test
+```
+
+경로가 다르면 `configs/transformer_ebnerd.gin`의
+`train.train_path`와 `train.validation_path`를 고친다.
+실제로 어느 경로를 보고 있는지는 `sweep.preflight`가 출력한다.
+
+MIND에는 test 파일이 없으므로 최종 Test 평가는 EB-NeRD에서만 한다.
+
+---
+
 ## 설치
 
 PyTorch를 먼저 설치한다. GPU와 CUDA 버전에 맞는 빌드를 써야 한다.
@@ -266,11 +287,18 @@ python -m sweep.run_seed_robustness ... --retry-failed --accept-auto
 
 ## 성능이 같을 때의 선택 기준
 
-Validation 지표 7개가 모두 tolerance 이내로 같으면 비용으로 고른다.
+Validation 지표 **6개**가 모두 tolerance 이내로 같으면 비용으로 고른다.
 
 ```
-total_parameters ↑ → mean_epoch_seconds ↑ → peak_gpu_memory_mb ↑ → config_hash ↑
+Top-1 → MRR → nDCG@5 → AUC → Preference Loss → Positive Probability
+   → total_parameters ↑ → mean_epoch_seconds ↑ → peak_gpu_memory_mb ↑ → config_hash ↑
 ```
+
+`Positive−Negative Score Gap`은 **선택에 쓰지 않는다.** config마다 스케일이 달라
+비교 기준을 정할 수 없고, 선택에 남겨두면 실제 데이터에서 값이 항상 달라
+비용 기준이 한 번도 호출되지 않기 때문이다.
+대신 최고값보다 상대적으로 10% 이상 낮으면 경고로 알린다.
+자세한 근거는 [DECISION_RULE.md](DECISION_RULE.md) 참고.
 
 `peak_gpu_memory_mb`는 run마다 `torch.cuda.max_memory_allocated`로 측정해
 `run_summary.json`과 `summary.csv`에 저장한다.

@@ -37,8 +37,18 @@ TransformerLoss.lambda_preference = 1.0
 
 
 # Dataset paths --------------------------
-train.train_path = "/home/ubuntu/shared/datasets/ebnerd/train_sequences_1pos4neg.parquet"
-train.validation_path = "/home/ubuntu/shared/datasets/ebnerd/validation_sequences_1pos4neg_half.parquet"
+# 데이터 경로
+#
+# ~ 는 로그인 사용자의 홈 디렉터리로 풀린다.
+# 계정이 ubuntu든 ec2-user든 같은 config가 그대로 동작한다.
+#
+# 서버 배치:
+#   ~/shared/raw/        공통 전처리 산출물
+#   ~/shared/datasets/   Transformer 입력 (이 파일이 보는 위치)
+#
+# validation_..._half.parquet는 split_validation.py가 만든다.
+train.train_path = "~/shared/datasets/ebnerd/train_sequences_1pos4neg.parquet"
+train.validation_path = "~/shared/datasets/ebnerd/validation_sequences_1pos4neg_half.parquet"
 
 # 모델 checkpoint 저장 위치
 train.save_dir = "out/ebnerd"

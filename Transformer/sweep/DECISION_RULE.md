@@ -40,7 +40,34 @@ Validation 지표를 아래 순서로 본다.
 | 4 | AUC | 클수록 좋음 | 0.002 |
 | 5 | Preference Loss | 작을수록 좋음 | 0.005 |
 | 6 | Positive Probability | 클수록 좋음 | 0.002 |
-| 7 | Positive − Negative Score Gap | 클수록 좋음 | 0 |
+
+### Score Gap은 선택에 쓰지 않는다 (진단 전용)
+
+`Positive − Negative Score Gap`은 기록하고 **경고에만** 쓴다.
+
+**이유 3가지:**
+
+1. **config마다 스케일이 다르다.**
+   score gap은 log 확률 3개 합의 차이다. `d_model`이나 `num_layers`가 바뀌면
+   모델의 전체 확신도 수준이 통째로 달라지므로, 서로 다른 구조 사이에서
+   "0.01 차이는 같다"고 말할 절대 기준을 정할 수 없다.
+
+2. **여기까지 내려왔다면 이미 노이즈다.**
+   앞의 6개 지표가 모두 tolerance 이내라는 것은 순위 품질이 사실상 같다는 뜻이다.
+   그 상태의 score gap 차이는 성능 차이가 아니라 확신도의 우연한 변동에 가깝다.
+
+3. **선택에 남겨두면 비용 기준이 죽는다.**
+   실제 데이터에서 score gap이 소수점까지 같을 일은 거의 없다.
+   tolerance 0으로 이 규칙이 남아 있으면 아래 비용 기준은 영원히 호출되지 않는다.
+
+대신 선택된 config의 score gap이 그 단계 최고값보다
+**상대적으로 10% 이상 낮으면 경고**를 남긴다.
+절대값이 아니라 비율로 보는 이유는 위 1번과 같다.
+
+> 절대 tolerance(예: 0.01)를 주는 방식도 가능하다.
+> 그렇게 하려면 `sweep/stages.py`의 `DIAGNOSTIC_METRICS`에 있는 항목을
+> tolerance를 채워 `METRIC_PRIORITY` 끝으로 옮기면 된다.
+> 다만 실제 score gap의 크기를 측정하기 전에는 그 값을 정할 근거가 없다.
 
 ### 성능이 같을 때 — 비용 기준
 
@@ -49,10 +76,10 @@ Validation 지표를 아래 순서로 본다.
 
 | 순위 | 기준 | 방향 | 이유 |
 |---|---|---|---|
-| 8 | `total_parameters` | 작을수록 | 과적합 위험이 낮고 추론이 빠르다 |
-| 9 | `mean_epoch_seconds` | 작을수록 | 남은 단계의 탐색 비용이 줄어든다 |
-| 10 | `peak_gpu_memory_mb` | 작을수록 | 뒤 단계에서 batch를 키울 여유가 생긴다 |
-| 11 | `config_hash` | 오름차순 | 실행 순서와 무관하게 항상 같은 결과 |
+| 7 | `total_parameters` | 작을수록 | 과적합 위험이 낮고 추론이 빠르다 |
+| 8 | `mean_epoch_seconds` | 작을수록 | 남은 단계의 탐색 비용이 줄어든다 |
+| 9 | `peak_gpu_memory_mb` | 작을수록 | 뒤 단계에서 batch를 키울 여유가 생긴다 |
+| 10 | `config_hash` | 오름차순 | 실행 순서와 무관하게 항상 같은 결과 |
 
 tolerance는 0이다. 여기까지 왔다는 것은 성능 판단이 이미 끝났다는 뜻이므로
 비용은 조금이라도 낮은 쪽을 고른다.
@@ -74,6 +101,7 @@ CPU 학습이면 값이 비어 있고, 그 경우 이 기준은 건너뛴다.
 | `total_loss` | `lambda_preference = 1`이라 Preference Loss와 값이 같다 |
 | `negative_prob` | softmax 합이 1이라 Positive Probability에서 계산된다 |
 | `nDCG@10` | 후보가 5개라 rank가 항상 10 이하이므로 nDCG@5와 항상 같다 |
+| `score_gap` | config 간 스케일이 달라 비교 불가. 경고에만 사용 (위 참고) |
 
 기록은 모두 남긴다. 선정에만 쓰지 않는다.
 
@@ -224,10 +252,11 @@ Final Top-3 × seed 3개를 모두 **30 epoch / patience 5**로 새로 학습한
 4. 평균 Validation AUC
 5. 평균 Validation Preference Loss
 6. 평균 Positive Probability
-7. 평균 Score Gap
-8. **Top-1 표준편차가 작은 설정** (seed에 덜 흔들리는 쪽)
-9. `total_parameters` → `mean_epoch_seconds` → `peak_gpu_memory_mb`
-10. `config_hash` 오름차순
+7. **Top-1 표준편차가 작은 설정** (seed에 덜 흔들리는 쪽)
+8. `total_parameters` → `mean_epoch_seconds` → `peak_gpu_memory_mb`
+9. `config_hash` 오름차순
+
+평균 Score Gap은 `config_aggregate.csv`에 기록하되 선택에는 쓰지 않는다.
 
 seed는 파라미터가 아니다.
 성능이 잘 나온 seed를 고르지 않는다.
@@ -275,3 +304,42 @@ seed가 모자란 설정은 `config_aggregate.csv`에 남기되 순위에서 제
 
 > 후보가 1 positive + 4 negative로 고정되어 있어 nDCG@10은 nDCG@5와
 > 항상 동일한 값을 가지므로 별도로 보고하지 않는다.
+
+
+---
+
+## 9. 데이터 경로
+
+gin config는 `~` 표기를 쓴다.
+
+```
+train.train_path      = "~/shared/datasets/ebnerd/train_sequences_1pos4neg.parquet"
+train.validation_path = "~/shared/datasets/ebnerd/validation_sequences_1pos4neg_half.parquet"
+```
+
+`~`는 로그인 사용자의 홈 디렉터리로 풀리므로, 계정이 `ubuntu`든 `ec2-user`든
+같은 config가 그대로 동작한다. 절대경로를 적어도 된다.
+
+서버 배치:
+
+```
+~/shared/
+├── raw/                  공통 전처리 산출물
+│   ├── mind/
+│   └── ebnerd/
+└── datasets/             Transformer 입력 (gin config가 보는 위치)
+    ├── mind/
+    │   ├── train_sequences_1pos4neg.parquet
+    │   ├── validation_sequences_1pos4neg.parquet
+    │   └── validation_sequences_1pos4neg_half.parquet
+    └── ebnerd/
+        ├── train_sequences_1pos4neg.parquet
+        ├── validation_sequences_1pos4neg.parquet
+        ├── validation_sequences_1pos4neg_half.parquet
+        └── test_sequences_1pos4neg.parquet
+```
+
+`validation_..._half.parquet`와 `test_...parquet`는 `split_validation.py`가 만든다.
+MIND에는 test가 없으므로 최종 Test 평가는 EB-NeRD에서만 한다.
+
+실제로 어느 경로를 보고 있는지는 `sweep.preflight`가 출력한다.

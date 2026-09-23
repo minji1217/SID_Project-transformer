@@ -14,8 +14,10 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 
 from sweep.stages import (
+    DIAGNOSTIC_METRICS,
     FINAL_TIEBREAK_KEY,
     METRIC_PRIORITY,
+    SCORE_GAP_WARNING_RATIO,
     SELECTION_RULES,
     MetricRule,
 )
@@ -282,6 +284,33 @@ def check_stage_warnings(
                 f"선택된 config의 {rule.label}={winner_value:.6f}이(가) "
                 f"이 단계 최고값 {best:.6f}보다 낮다. "
                 "지표 간 판단이 엇갈리므로 확인이 필요하다."
+            )
+
+    # 진단 지표는 선택에 쓰지 않지만, 크게 어긋나면 알린다.
+    #
+    # 절대값이 아니라 비율로 본다. score gap은 log 확률의 차이라
+    # 모델 구조에 따라 전체 스케일이 달라지므로,
+    # "0.05 차이"가 어떤 config에서는 크고 어떤 config에서는 작다.
+    for rule in DIAGNOSTIC_METRICS:
+        best = _best_value(rows, rule)
+        winner_value = _metric_value(winner, rule.key)
+
+        if best is None or winner_value is None:
+            continue
+
+        scale = abs(best)
+
+        if scale <= 0:
+            continue
+
+        shortfall = (best - winner_value) / scale
+
+        if shortfall > SCORE_GAP_WARNING_RATIO:
+            warnings.append(
+                f"선택된 config의 {rule.label}={winner_value:.4f}이(가) "
+                f"이 단계 최고값 {best:.4f}보다 {shortfall:.1%} 낮다. "
+                "선택 기준은 아니지만 정답과 오답의 점수 분리가 "
+                "상대적으로 약하다는 신호이므로 확인할 것."
             )
 
     return warnings

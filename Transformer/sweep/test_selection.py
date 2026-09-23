@@ -11,6 +11,7 @@ import sys
 
 from sweep.selection import (
     NotEnoughSuccessfulRuns,
+    check_stage_warnings,
     filter_complete_seed_configs,
     pick_winner,
     rank_rows,
@@ -321,6 +322,90 @@ def main() -> int:
         "기대 seed 수가 2면 B만 통과",
         [entry["config"] for entry in complete],
         ["B"],
+    )
+
+    # ------------------------------------------------------------------
+    checker.section("14. score gap이 미세하게 달라도 비용 기준이 작동한다")
+
+    # 실제 데이터에서 score gap이 소수점까지 같을 일은 거의 없다.
+    # score gap이 선택 규칙에 남아 있었다면 여기서 BIG이 이겨버리고
+    # total_parameters 이하는 영원히 호출되지 않는다.
+    rows = [
+        row(
+            "BIG",
+            val_score_gap=1.9000,
+            total_parameters=20_000_000,
+            config_hash="aaa",
+        ),
+        row(
+            "SMALL",
+            val_score_gap=1.8500,
+            total_parameters=10_000_000,
+            config_hash="zzz",
+        ),
+    ]
+    winner, trace = pick_winner(rows)
+
+    checker.equals("승자", winner["config"], "SMALL")
+    checker.check(
+        "score gap이 더 높은 BIG이 이기지 않음",
+        winner["config"] == "SMALL",
+        f"BIG gap=1.9000 > SMALL gap=1.8500",
+    )
+    checker.check(
+        "판단 근거가 파라미터 수에서 끝남",
+        "파라미터" in trace[-1],
+        f"마지막 근거={trace[-1]!r}",
+    )
+    checker.check(
+        "score gap은 판단 근거에 등장하지 않음",
+        not any("Score Gap" in line for line in trace),
+        f"trace={trace}",
+    )
+
+    # 차이가 더 작아도, 더 커도 결과는 같아야 한다
+    for gap in (1.8999, 1.5000, 0.0001):
+        rows = [
+            row("BIG", val_score_gap=1.9, total_parameters=20_000_000),
+            row("SMALL", val_score_gap=gap, total_parameters=10_000_000),
+        ]
+        winner, _ = pick_winner(rows)
+        checker.equals(
+            f"SMALL의 gap이 {gap}일 때도 승자",
+            winner["config"],
+            "SMALL",
+        )
+
+    # ------------------------------------------------------------------
+    checker.section("15. score gap은 경고로만 쓰인다")
+
+    # 상대 차이 10% 미만이면 경고하지 않는다
+    rows = [
+        row("BIG", val_score_gap=1.90, total_parameters=20_000_000),
+        row("SMALL", val_score_gap=1.85, total_parameters=10_000_000),
+    ]
+    winner, _ = pick_winner(rows)
+    warnings = check_stage_warnings(rows, winner)
+
+    checker.check(
+        "2.6% 차이는 경고하지 않음",
+        not any("Score Gap" in line for line in warnings),
+        f"warnings={warnings}",
+    )
+
+    # 상대 차이가 10%를 넘으면 경고한다
+    rows = [
+        row("BIG", val_score_gap=2.00, total_parameters=20_000_000),
+        row("SMALL", val_score_gap=1.50, total_parameters=10_000_000),
+    ]
+    winner, _ = pick_winner(rows)
+    warnings = check_stage_warnings(rows, winner)
+
+    checker.equals("승자는 여전히 작은 모델", winner["config"], "SMALL")
+    checker.check(
+        "25% 차이는 경고함",
+        any("Score Gap" in line for line in warnings),
+        f"warnings={[w for w in warnings if 'Score Gap' in w]}",
     )
 
     return checker.finish()

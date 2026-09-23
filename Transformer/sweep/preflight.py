@@ -436,7 +436,8 @@ def check_forward(report: Report, config_path: Path) -> None:
 
 
 def resolve_path(value: str) -> Path:
-    path = Path(value)
+    # "~/shared/datasets/..." 표기를 지원한다
+    path = Path(value).expanduser()
     return path if path.is_absolute() else BASE_DIR / path
 
 

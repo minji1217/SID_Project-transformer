@@ -20,8 +20,8 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 
 def resolve_path(path: str) -> Path:
-    # 상대경로를 Transformer 프로젝트 기준 절대경로로 변환
-    path_obj = Path(path)
+    # "~/..." 표기를 풀고, 상대경로는 Transformer 기준 절대경로로 변환
+    path_obj = Path(path).expanduser()
     return path_obj if path_obj.is_absolute() else BASE_DIR / path_obj
 
 

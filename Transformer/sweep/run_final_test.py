@@ -36,7 +36,8 @@ TEST_METRICS = ("top1_accuracy", "auc", "mrr", "ndcg@5", "ndcg@10")
 
 
 def resolve_path(value: str) -> Path:
-    path = Path(value)
+    # "~/shared/datasets/..." 표기를 지원한다
+    path = Path(value).expanduser()
     return path if path.is_absolute() else BASE_DIR / path
 
 
@@ -64,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--test-path",
         type=str,
-        default="datasets/ebnerd/test_sequences_1pos4neg.parquet",
+        default="~/shared/datasets/ebnerd/test_sequences_1pos4neg.parquet",
     )
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=0)

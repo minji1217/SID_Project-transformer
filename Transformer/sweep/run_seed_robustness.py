@@ -162,11 +162,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
-    sweep_dir = Path(args.sweep_out)
+    sweep_dir = Path(args.sweep_out).expanduser()
     if not sweep_dir.is_absolute():
         sweep_dir = BASE_DIR / sweep_dir
 
-    base_config = Path(args.config)
+    base_config = Path(args.config).expanduser()
     if not base_config.is_absolute():
         base_config = BASE_DIR / base_config
 

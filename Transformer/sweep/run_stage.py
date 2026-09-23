@@ -45,7 +45,7 @@ from sweep.selection import (
     select_stage_top_k,
 )
 from sweep.stages import (
-    METRIC_PRIORITY,
+    REPORTED_METRICS,
     STAGES,
     get_stage,
     is_final_stage,
@@ -59,8 +59,9 @@ TRAIN_SCRIPT = BASE_DIR / "train_transformer.py"
 COMPLETE_MARKER = "_COMPLETE.json"
 FAILED_MARKER = "_FAILED.json"
 
-# summary.csv에서 앞쪽에 보여줄 지표 (우선순위 순)
-METRIC_COLUMNS = [rule.key for rule in METRIC_PRIORITY]
+# summary.csv에서 앞쪽에 보여줄 열
+# 선택에 쓰는 지표 -> 진단 지표 -> 비용 기준 순서
+METRIC_COLUMNS = [rule.key for rule in REPORTED_METRICS]
 
 # summary.csv에 내보내지 않는 내부 값
 INTERNAL_COLUMNS = {"_params"}
@@ -371,11 +372,11 @@ def main() -> int:
     stage = get_stage(args.stage)
     final_stage = is_final_stage(args.stage)
 
-    sweep_dir = Path(args.out)
+    sweep_dir = Path(args.out).expanduser()
     if not sweep_dir.is_absolute():
         sweep_dir = BASE_DIR / sweep_dir
 
-    base_config = Path(args.config)
+    base_config = Path(args.config).expanduser()
     if not base_config.is_absolute():
         base_config = BASE_DIR / base_config
 

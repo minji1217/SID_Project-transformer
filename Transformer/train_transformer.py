@@ -47,8 +47,11 @@ def set_seed(seed: int) -> None:
 
 
 def resolve_path(path: str) -> Path:
-    # 상대경로를 Transformer 프로젝트 기준 절대경로로 변환
-    path_obj = Path(path)
+    # "~/shared/datasets/..." 같은 홈 디렉터리 표기를 먼저 풀고,
+    # 상대경로면 Transformer 프로젝트 기준 절대경로로 바꾼다.
+    #
+    # ~를 쓰면 로그인 사용자가 ubuntu든 ec2-user든 같은 config가 동작한다.
+    path_obj = Path(path).expanduser()
     return path_obj if path_obj.is_absolute() else BASE_DIR / path_obj
 
 

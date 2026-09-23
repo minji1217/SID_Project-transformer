@@ -54,8 +54,44 @@ METRIC_PRIORITY: List[MetricRule] = [
     MetricRule("val_auc", "max", 0.002, "AUC"),
     MetricRule("val_preference_loss", "min", 0.005, "Preference Loss"),
     MetricRule("val_positive_prob", "max", 0.002, "Positive Probability"),
-    MetricRule("val_score_gap", "max", 0.0, "Positive-Negative Score Gap"),
 ]
+
+
+# --------------------------------------------------------------- 진단 지표
+#
+# Positive-Negative Score Gap은 기록하고 경고에만 쓰며, 선택에는 쓰지 않는다.
+#
+# 이유:
+#   1. config마다 스케일이 다르다.
+#      score gap은 positive_score - negative_score이고, 이 score는
+#      log 확률 3개의 합이다. d_model이나 num_layers가 바뀌면 모델의
+#      전체 확신도 수준이 통째로 달라지므로, 서로 다른 구조 사이에서
+#      "0.01 차이는 같다"고 말할 절대 기준을 정할 수 없다.
+#
+#   2. 여기까지 내려왔다면 이미 노이즈다.
+#      앞의 6개 지표가 모두 tolerance 이내라는 것은 순위 품질이
+#      사실상 같다는 뜻이다. 그 상태에서 score gap의 미세한 차이는
+#      성능 차이가 아니라 확신도의 우연한 변동에 가깝다.
+#
+#   3. tolerance 0.0으로 두면 비용 기준이 작동하지 않는다.
+#      실제 데이터에서 score gap이 소수점까지 같을 일은 거의 없으므로,
+#      이 규칙이 남아 있으면 total_parameters 이하는 영원히 호출되지 않는다.
+#
+# 대신 선택된 config의 score gap이 그 단계 최고값보다 상대적으로
+# 크게 낮으면 경고를 남긴다. (sweep/selection.py의 check_stage_warnings)
+
+DIAGNOSTIC_METRICS: List[MetricRule] = [
+    MetricRule(
+        "val_score_gap",
+        "max",
+        0.0,
+        "Positive-Negative Score Gap",
+    ),
+]
+
+# 선택된 config의 score gap이 최고값보다 이 비율 이상 낮으면 경고한다.
+# 절대값이 아니라 비율로 판단해야 config 간 스케일 차이에 휘둘리지 않는다.
+SCORE_GAP_WARNING_RATIO = 0.10
 
 
 # ------------------------------------------------------------ 동점 처리 규칙
@@ -83,6 +119,11 @@ FINAL_TIEBREAK_KEY = "config_hash"
 
 # 단계별 선택에 실제로 쓰는 전체 규칙
 SELECTION_RULES: List[MetricRule] = METRIC_PRIORITY + TIEBREAK_RULES
+
+# 요약 CSV에서 앞쪽에 보여줄 열 (선택에 쓰는 지표 + 진단 지표 + 비용)
+REPORTED_METRICS: List[MetricRule] = (
+    METRIC_PRIORITY + DIAGNOSTIC_METRICS + TIEBREAK_RULES
+)
 
 
 # ------------------------------------------------------------------- 단계 정의
