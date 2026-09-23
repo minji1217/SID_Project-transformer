@@ -54,8 +54,31 @@ train.weight_decay = 0.01
 # gradient 크기를 최대 1.0으로 제한
 train.gradient_clip_norm = 1.0
 
-# DataLoader가 별도 CPU worker 없이 메인 프로세스 하나에서 데이터를 불러오도록 설정
-train.num_workers = 0
+# DataLoader worker 프로세스 수.
+# 0이면 메인 프로세스가 데이터 로딩과 학습을 혼자 처리해 GPU가 대기한다.
+# AWS 인스턴스의 vCPU 수 절반~전부 정도로 설정한다.
+# (메모리가 부족하면 값을 낮춘다)
+train.num_workers = 4
+
+# 각 worker가 미리 준비해 둘 batch 수. num_workers > 0일 때만 적용된다.
+train.prefetch_factor = 4
+
+# Mixed precision 학습.
+# Ampere 이상 GPU(A10G / A100 / L4)에서 1.5~2배 빨라진다.
+# bfloat16 미지원 GPU(T4 등)에서는 float16으로 자동 전환된다.
+# log_softmax / cross_entropy는 PyTorch가 fp32로 처리하므로
+# candidate score 계산의 수치 안정성은 유지된다.
+train.use_amp = True
+train.amp_dtype = "bfloat16"
+
+# epoch마다 checkpoint_epoch_N.pt를 저장할지 여부.
+# 파라미터 탐색처럼 여러 번 학습할 때는 False로 둔다.
+# False여도 checkpoint_best.pt / checkpoint_final.pt는 항상 저장된다.
+train.save_every_epoch = False
+
+# checkpoint에 optimizer(AdamW) 상태를 함께 저장할지 여부.
+# 저장하면 파일 크기가 약 3배가 되지만 학습 재개가 가능하다.
+train.save_optimizer_state = True
 
 train.seed = 42
 train.early_stopping_patience = 5

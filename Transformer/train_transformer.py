@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import random
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import gin
 import numpy as np
@@ -38,6 +38,68 @@ def resolve_path(path: str) -> Path:
 
 def get_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def resolve_amp(
+    use_amp: bool,
+    amp_dtype: str,
+    device: torch.device,
+) -> Tuple[bool, Optional[torch.dtype]]:
+    # AMP(Automatic Mixed Precision) 사용 여부와 실제 dtype을 결정
+    #
+    # AMP를 켜면 forward/backward 계산을 16bit로 수행해
+    # Ampere 이상 GPU에서 1.5~2배 빨라진다.
+    # log_softmax / cross_entropy는 PyTorch가 자동으로 fp32로
+    # 처리하므로 candidate score 계산의 수치 안정성은 유지된다.
+    if not use_amp:
+        return False, None
+
+    if device.type != "cuda":
+        print("[AMP] CUDA device가 아니므로 AMP를 사용하지 않습니다.")
+        return False, None
+
+    dtype_table = {
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float16": torch.float16,
+        "fp16": torch.float16,
+    }
+
+    key = str(amp_dtype).strip().lower()
+
+    if key not in dtype_table:
+        raise ValueError(
+            "amp_dtype must be one of "
+            f"{sorted(set(dtype_table))}. "
+            f"Received: {amp_dtype}"
+        )
+
+    dtype = dtype_table[key]
+
+    # bfloat16 미지원 GPU(T4 등)에서는 float16으로 자동 전환
+    if (
+        dtype is torch.bfloat16
+        and not torch.cuda.is_bf16_supported()
+    ):
+        print(
+            "[AMP] 이 GPU는 bfloat16을 지원하지 않아 "
+            "float16으로 전환합니다."
+        )
+        dtype = torch.float16
+
+    return True, dtype
+
+
+def create_grad_scaler(amp_dtype: Optional[torch.dtype]):
+    # GradScaler는 float16에서만 필요하다.
+    # bfloat16은 표현 범위가 fp32와 같아 scaling이 필요 없다.
+    if amp_dtype is not torch.float16:
+        return None
+
+    try:
+        return torch.amp.GradScaler("cuda")
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.GradScaler()
 
 
 def create_metric_dict() -> Dict[str, float]:
@@ -159,6 +221,9 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     gradient_clip_norm: Optional[float] = 1.0,
+    amp_enabled: bool = False,
+    amp_dtype: Optional[torch.dtype] = None,
+    scaler=None,
 ) -> Dict[str, float]:
     # training dataset 전체를 한 번 학습
     model.train()
@@ -175,30 +240,55 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
 
         # Forward
-        model_output = model(
-            history_sids=history_sids,
-            history_mask=history_mask,
-            candidate_sids=candidate_sids,
-        )
-
-        # Loss
-        loss_output = loss_fn(
-            candidate_scores=model_output.candidate_scores,
-            candidate_labels=candidate_labels,
-        )
-
-        # Backpropagation
-        loss_output.total_loss.backward()
-
-        # Gradient clipping
-        if gradient_clip_norm is not None:
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(),
-                max_norm=gradient_clip_norm,
+        # amp_enabled=False이면 autocast는 아무 일도 하지 않는다.
+        with torch.autocast(
+            device_type=device.type,
+            dtype=amp_dtype,
+            enabled=amp_enabled,
+        ):
+            model_output = model(
+                history_sids=history_sids,
+                history_mask=history_mask,
+                candidate_sids=candidate_sids,
             )
 
-        # Parameter update
-        optimizer.step()
+            # Loss
+            loss_output = loss_fn(
+                candidate_scores=model_output.candidate_scores,
+                candidate_labels=candidate_labels,
+            )
+
+        if scaler is not None:
+            # float16 AMP: gradient를 scaling해서 underflow를 막는다.
+            scaler.scale(loss_output.total_loss).backward()
+
+            # Gradient clipping 전에 scaling을 되돌려야
+            # clip이 실제 gradient 크기 기준으로 동작한다.
+            if gradient_clip_norm is not None:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    max_norm=gradient_clip_norm,
+                )
+
+            # Parameter update
+            scaler.step(optimizer)
+            scaler.update()
+
+        else:
+            # fp32 또는 bfloat16 AMP
+            # Backpropagation
+            loss_output.total_loss.backward()
+
+            # Gradient clipping
+            if gradient_clip_norm is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    max_norm=gradient_clip_norm,
+                )
+
+            # Parameter update
+            optimizer.step()
 
         # Metric update
         update_metrics(
@@ -220,6 +310,8 @@ def evaluate(
     loss_fn: TransformerLoss,
     dataloader: DataLoader,
     device: torch.device,
+    amp_enabled: bool = False,
+    amp_dtype: Optional[torch.dtype] = None,
 ) -> Dict[str, float]:
     # validation dataset에서 loss와 Top-1 성능 계산
     model.eval()
@@ -233,17 +325,22 @@ def evaluate(
         candidate_labels = batch["candidate_labels"].to(device, non_blocking=True)
 
         # Forward
-        model_output = model(
-            history_sids=history_sids,
-            history_mask=history_mask,
-            candidate_sids=candidate_sids,
-        )
+        with torch.autocast(
+            device_type=device.type,
+            dtype=amp_dtype,
+            enabled=amp_enabled,
+        ):
+            model_output = model(
+                history_sids=history_sids,
+                history_mask=history_mask,
+                candidate_sids=candidate_sids,
+            )
 
-        # Loss
-        loss_output = loss_fn(
-            candidate_scores=model_output.candidate_scores,
-            candidate_labels=candidate_labels,
-        )
+            # Loss
+            loss_output = loss_fn(
+                candidate_scores=model_output.candidate_scores,
+                candidate_labels=candidate_labels,
+            )
 
         # Metric
         update_metrics(
@@ -301,18 +398,27 @@ def save_checkpoint(
     epoch: int,
     validation_loss: float,
     validation_top1_accuracy: float,
+    include_optimizer: bool = True,
 ) -> None:
     # model/optimizer 상태와 gin 설정 저장
+    #
+    # optimizer 상태(AdamW의 moment 2개)는 모델 크기의 약 2배라
+    # 파일 크기의 대부분을 차지한다.
+    # 학습 재개가 필요 없는 탐색 단계에서는 제외할 수 있다.
     path.parent.mkdir(parents=True, exist_ok=True)
 
     checkpoint = {
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
         "validation_loss": validation_loss,
         "validation_top1_accuracy": validation_top1_accuracy,
         "gin_config": gin.config_str(),
     }
+
+    if include_optimizer:
+        checkpoint["optimizer_state_dict"] = (
+            optimizer.state_dict()
+        )
 
     torch.save(checkpoint, path)
 
@@ -328,8 +434,13 @@ def train(
     weight_decay: float = 0.01,
     gradient_clip_norm: Optional[float] = 1.0,
     num_workers: int = 0,
+    prefetch_factor: int = 4,
     seed: int = 42,
     early_stopping_patience: Optional[int] = None,
+    use_amp: bool = False,
+    amp_dtype: str = "bfloat16",
+    save_every_epoch: bool = True,
+    save_optimizer_state: bool = True,
 ) -> None:
     # train/validation dataset을 이용해 Transformer 전체 학습
     set_seed(seed)
@@ -341,6 +452,37 @@ def train(
 
     if device.type == "cuda":
         print("GPU:", torch.cuda.get_device_name(0))
+
+    # AMP
+    amp_enabled, resolved_amp_dtype = resolve_amp(
+        use_amp=use_amp,
+        amp_dtype=amp_dtype,
+        device=device,
+    )
+
+    print(
+        "AMP             :",
+        (
+            str(resolved_amp_dtype).replace("torch.", "")
+            if amp_enabled
+            else "disabled (float32)"
+        ),
+    )
+    print("DataLoader workers:", num_workers)
+    print(
+        "Checkpoint      :",
+        (
+            "every epoch + best + final"
+            if save_every_epoch
+            else "best + final only"
+        ),
+        "|",
+        (
+            "with optimizer state"
+            if save_optimizer_state
+            else "model only"
+        ),
+    )
 
     # Path
     train_path = resolve_path(train_path)
@@ -373,6 +515,15 @@ def train(
     print("Validation samples :", f"{len(validation_dataset):,}")
 
     # DataLoader
+    # num_workers > 0일 때만 worker 관련 옵션을 줄 수 있다.
+    # persistent_workers는 epoch마다 worker를 다시 만드는 비용을 없애고,
+    # prefetch_factor는 worker가 미리 준비해 둘 batch 수를 정한다.
+    dataloader_kwargs: Dict[str, Any] = {}
+
+    if num_workers > 0:
+        dataloader_kwargs["persistent_workers"] = True
+        dataloader_kwargs["prefetch_factor"] = prefetch_factor
+
     train_loader = DataLoader(
         dataset=train_dataset,
         batch_size=batch_size,
@@ -380,6 +531,7 @@ def train(
         num_workers=num_workers,
         collate_fn=collate_news_sequences,
         pin_memory=(device.type == "cuda"),
+        **dataloader_kwargs,
     )
 
     validation_loader = DataLoader(
@@ -389,6 +541,7 @@ def train(
         num_workers=num_workers,
         collate_fn=collate_news_sequences,
         pin_memory=(device.type == "cuda"),
+        **dataloader_kwargs,
     )
 
     # Model / Loss / Optimizer
@@ -400,6 +553,8 @@ def train(
         lr=learning_rate,
         weight_decay=weight_decay,
     )
+
+    scaler = create_grad_scaler(resolved_amp_dtype)
 
     # Parameter count
     total_parameters = sum(
@@ -425,6 +580,8 @@ def train(
         loss_fn=loss_fn,
         dataloader=validation_loader,
         device=device,
+        amp_enabled=amp_enabled,
+        amp_dtype=resolved_amp_dtype,
     )
 
     print_metrics(
@@ -460,6 +617,9 @@ def train(
             optimizer=optimizer,
             device=device,
             gradient_clip_norm=gradient_clip_norm,
+            amp_enabled=amp_enabled,
+            amp_dtype=resolved_amp_dtype,
+            scaler=scaler,
         )
 
         print_metrics(
@@ -473,6 +633,8 @@ def train(
             loss_fn=loss_fn,
             dataloader=validation_loader,
             device=device,
+            amp_enabled=amp_enabled,
+            amp_dtype=resolved_amp_dtype,
         )
 
         print_metrics(
@@ -484,14 +646,19 @@ def train(
         validation_top1 = validation_metrics["top1_accuracy"]
 
         # Every epoch checkpoint
-        save_checkpoint(
-            path=save_dir / f"checkpoint_epoch_{epoch}.pt",
-            model=model,
-            optimizer=optimizer,
-            epoch=epoch,
-            validation_loss=validation_loss,
-            validation_top1_accuracy=validation_top1,
-        )
+        # 파라미터 탐색 중에는 save_every_epoch=False로 두어
+        # epoch마다 쌓이는 checkpoint 용량을 없앤다.
+        # checkpoint_best.pt와 checkpoint_final.pt는 항상 저장된다.
+        if save_every_epoch:
+            save_checkpoint(
+                path=save_dir / f"checkpoint_epoch_{epoch}.pt",
+                model=model,
+                optimizer=optimizer,
+                epoch=epoch,
+                validation_loss=validation_loss,
+                validation_top1_accuracy=validation_top1,
+                include_optimizer=save_optimizer_state,
+            )
 
         # Best checkpoint
         # Validation Top-1 Accuracy가 가장 높은 epoch를 best로 선택
@@ -507,6 +674,7 @@ def train(
                 epoch=epoch,
                 validation_loss=validation_loss,
                 validation_top1_accuracy=validation_top1,
+                include_optimizer=save_optimizer_state,
             )
 
             print(
@@ -546,6 +714,7 @@ def train(
         epoch=epoch,
         validation_loss=validation_loss,
         validation_top1_accuracy=validation_top1,
+        include_optimizer=save_optimizer_state,
     )
 
     print()
