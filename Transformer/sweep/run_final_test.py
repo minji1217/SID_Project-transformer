@@ -154,8 +154,10 @@ def main() -> int:
         prediction_path = output_dir / f"test_scores_seed_{seed}.parquet"
         log_path = output_dir / f"predict_seed_{seed}.log"
 
+        # -u: 출력 버퍼링을 꺼서 로그가 실시간으로 남게 한다
         command = [
             sys.executable,
+            "-u",
             str(PREDICT_SCRIPT),
             "--config",
             str(base_config),

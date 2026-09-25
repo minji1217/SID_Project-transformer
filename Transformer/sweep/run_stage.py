@@ -165,8 +165,15 @@ def run_training(
         encoding="utf-8",
     )
 
+    # -u는 출력 버퍼링을 끈다.
+    #
+    # print()는 화면이 아닌 파일로 연결되면 8KB쯤 모았다가 한 번에 쓴다.
+    # epoch 하나의 출력이 600바이트 남짓이라, 버퍼링이 켜져 있으면
+    # 10 epoch이 넘게 지나야 train_log.txt에 내용이 나타난다.
+    # 긴 학습에서 진행 상황을 확인할 수 없게 되므로 끈다.
     command = [
         sys.executable,
+        "-u",
         str(TRAIN_SCRIPT),
         "--config",
         str(base_config),
