@@ -27,6 +27,7 @@ import csv
 import json
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -140,11 +141,33 @@ def backup_run_dir(run_dir: Path) -> Path:
     return backup_path
 
 
+def format_duration(seconds: float) -> str:
+    # 진행률 출력용 시간 포맷. 1시간 미만이면 MM:SS, 넘으면 H:MM:SS.
+    seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+
+    if hours > 0:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def progress_bar(done: int, total: int, width: int = 30) -> str:
+    # 단계 전체 진행률을 한눈에 보기 위한 막대.
+    if total <= 0:
+        return ""
+
+    filled = int(round(width * done / total))
+    return "#" * filled + "-" * (width - filled)
+
+
 def run_training(
     run_dir: Path,
     base_config: Path,
     bindings: Dict[str, Any],
     summary_extra: Dict[str, Any],
+    stream_output: bool = True,
 ) -> Optional[Dict[str, Any]]:
     # train_transformer.py를 별도 프로세스로 실행한다.
     #
@@ -191,22 +214,51 @@ def run_training(
 
     log_path = run_dir / "train_log.txt"
 
+    # 학습 프로세스의 출력을 로그 파일과 화면에 동시에 보낸다.
+    #
+    # 로그 파일만 쓰면 한 run이 수십 분 도는 동안 화면에 아무것도
+    # 나오지 않아 멈춘 것처럼 보인다. 진행률을 바로 볼 수 있게
+    # 같은 줄을 양쪽에 쓴다. --quiet를 주면 파일에만 남긴다.
     with log_path.open("w", encoding="utf-8") as log_file:
-        process = subprocess.run(
-            command,
-            cwd=str(BASE_DIR),
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-        )
+        if not stream_output:
+            process = subprocess.run(
+                command,
+                cwd=str(BASE_DIR),
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+            )
+            return_code = process.returncode
+        else:
+            popen = subprocess.Popen(
+                command,
+                cwd=str(BASE_DIR),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
 
-    if process.returncode == 0 and (run_dir / "run_summary.json").exists():
+            assert popen.stdout is not None
+
+            with popen.stdout as stream:
+                for line in stream:
+                    log_file.write(line)
+                    log_file.flush()
+                    sys.stdout.write("    " + line)
+                    sys.stdout.flush()
+
+            return_code = popen.wait()
+
+    if return_code == 0 and (run_dir / "run_summary.json").exists():
         return None
 
     log_text = log_path.read_text(encoding="utf-8", errors="replace")
 
     return build_failure_record(
         log_text=log_text,
-        return_code=process.returncode,
+        return_code=return_code,
         log_path=str(log_path),
     )
 
@@ -368,6 +420,14 @@ def parse_args() -> argparse.Namespace:
             "기존 폴더는 지우지 않고 시각이 붙은 이름으로 옮긴다."
         ),
     )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help=(
+            "학습 출력을 화면에 흘리지 않고 train_log.txt에만 남긴다. "
+            "기본은 화면에도 함께 출력한다."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
 
     return parser.parse_args()
@@ -482,6 +542,12 @@ def main() -> int:
     rows: List[Dict[str, Any]] = []
     params_by_hash: Dict[str, Dict[str, Any]] = {}
 
+    # 단계 전체 진행률과 남은 시간 추정에 쓴다.
+    # 재사용된 run은 학습 시간이 들지 않으므로 평균 계산에서 뺀다.
+    stage_start_time = time.time()
+    trained_count = 0
+    trained_seconds = 0.0
+
     for index, item in enumerate(planned, 1):
         run_dir = runs_dir / item["hash"]
         params_by_hash[item["hash"]] = item["params"]
@@ -489,9 +555,24 @@ def main() -> int:
         complete_marker = run_dir / COMPLETE_MARKER
         failed_marker = run_dir / FAILED_MARKER
 
+        done = index - 1
+        total = len(planned)
+
+        header = (
+            f"[{index}/{total}] "
+            f"[{progress_bar(done, total)}] {done / total:5.1%} 완료 | "
+            f"경과 {format_duration(time.time() - stage_start_time)}"
+        )
+
+        if trained_count > 0:
+            # 이번 실행에서 실제로 학습한 run들의 평균으로 남은 시간을 추정한다.
+            remaining = (trained_seconds / trained_count) * (total - done)
+            header += f" | 남은 약 {format_duration(remaining)}"
+
         print()
         print("-" * 78)
-        print(f"[{index}/{len(planned)}] {describe(item['params'])}")
+        print(header)
+        print(f"        {describe(item['params'])}")
 
         # 이전에 실패한 run을 다시 돌리는 경우
         if args.retry_failed and run_dir.exists() and not complete_marker.exists():
@@ -549,11 +630,23 @@ def main() -> int:
             "source_fingerprint": fingerprint,
         }
 
+        run_start_time = time.time()
+
         record = run_training(
             run_dir=run_dir,
             base_config=base_config,
             bindings=item["full"],
             summary_extra=summary_extra,
+            stream_output=(not args.quiet),
+        )
+
+        run_seconds = time.time() - run_start_time
+        trained_count += 1
+        trained_seconds += run_seconds
+
+        print(
+            f"[{index}/{len(planned)}] run 소요 "
+            f"{format_duration(run_seconds)}"
         )
 
         if record is None:

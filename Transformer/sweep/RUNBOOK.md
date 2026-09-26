@@ -165,6 +165,43 @@ stage_05_learning_rate_batch_size
 stage_06_dropout_weight_decay
 ```
 
+### 진행률 보기
+
+실행하면 화면에 진행 상황이 계속 나온다. 따로 켤 것은 없다.
+
+단계 전체 진행률 (run 단위):
+
+```
+[7/14] [#############-----------------] 42.9% 완료 | 경과 1:12:30 | 남은 약 1:36:40
+        d_model=384, num_heads=6
+```
+
+한 run 안의 진행률 (batch 단위):
+
+```
+    [Train 3/12] | 500/1,820 batch ( 27.5%) | loss 1.8234 | 경과 04:12 | 남은 11:05
+    [Train 3/12] 완료 | 1,820 batch | 소요 15:18
+    [Validation 3/12] | 200/228 batch ( 87.7%) | loss 1.7051 | 경과 00:41 | 남은 00:06
+```
+
+`남은` 시간은 지금까지의 평균 속도로 추정한 값이라 초반에는 부정확하다.
+
+같은 내용이 `runs/<config_hash>/train_log.txt`에도 그대로 저장되므로,
+tmux를 빠져나와 있어도 `tail -f`로 볼 수 있다.
+
+화면 출력이 거슬리면 `--quiet`을 붙인다. 로그 파일에는 그대로 남는다.
+
+```bash
+python -m sweep.run_stage --config configs/transformer_ebnerd.gin \
+  --stage 3 --out sweep_out/ebnerd --quiet
+```
+
+batch 진행률의 출력 주기는 `train.progress_interval`(기본 50 batch)이다.
+그냥 기본값을 쓰면 된다.
+**`configs/*.gin`에 이 값을 적지 말 것.**
+gin 파일을 한 글자라도 고치면 config hash가 바뀌어
+**이미 끝난 run이 전부 다시 돈다.**
+
 ### 탐색 예산
 
 탐색 단계는 기본 **최대 12 epoch / patience 3**으로 빠르게 비교한다.

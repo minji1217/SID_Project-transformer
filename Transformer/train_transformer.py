@@ -258,6 +258,111 @@ def finalize_metrics(
     }
 
 
+def format_duration(seconds: float) -> str:
+    # 진행률 출력용 시간 포맷. 1시간 미만이면 MM:SS, 넘으면 H:MM:SS.
+    seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+
+    if hours > 0:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+
+    return f"{minutes:02d}:{secs:02d}"
+
+
+class ProgressPrinter:
+    """batch 단위 진행률을 주기적으로 한 줄씩 출력한다.
+
+    tqdm처럼 캐리지 리턴(\r)으로 한 줄을 덮어쓰지 않고
+    interval batch마다 새 줄을 찍는다.
+    sweep 실행에서는 출력이 로그 파일로도 함께 저장되는데,
+    \r 기반 출력은 로그 파일에서 한 줄로 뭉쳐 읽을 수 없기 때문이다.
+    """
+
+    def __init__(
+        self,
+        label: str,
+        total: Optional[int],
+        interval: int,
+    ) -> None:
+        self.label = label
+        self.total = total if (total is not None and total > 0) else None
+        self.interval = max(0, int(interval))
+        self.start_time = time.time()
+        self.completed = 0
+
+    @property
+    def enabled(self) -> bool:
+        return self.interval > 0
+
+    def _should_print(self, step: int) -> bool:
+        if not self.enabled:
+            return False
+
+        # interval마다, 그리고 마지막 batch에서 반드시 한 번.
+        if step % self.interval == 0:
+            return True
+
+        return self.total is not None and step >= self.total
+
+    def will_print_next(self) -> bool:
+        # 다음 update()에서 줄을 찍을지 미리 알려준다.
+        # loss 값을 GPU에서 가져오는 비용을 출력하는 batch에서만 내기 위해 쓴다.
+        return self._should_print(self.completed + 1)
+
+    def update(self, loss_value: Optional[float] = None) -> None:
+        self.completed += 1
+        step = self.completed
+
+        if not self._should_print(step):
+            return
+
+        elapsed = time.time() - self.start_time
+
+        if self.total is not None:
+            ratio = step / self.total
+            position = f"{step:,}/{self.total:,} batch ({ratio:6.1%})"
+
+            # 지금까지의 평균 속도로 남은 시간을 추정한다.
+            remaining = (elapsed / step) * (self.total - step)
+            timing = (
+                f"경과 {format_duration(elapsed)} | "
+                f"남은 {format_duration(remaining)}"
+            )
+        else:
+            # IterableDataset 등 길이를 모르는 경우.
+            position = f"{step:,} batch"
+            timing = f"경과 {format_duration(elapsed)}"
+
+        parts = [f"  [{self.label}]", position]
+
+        if loss_value is not None:
+            parts.append(f"loss {loss_value:.4f}")
+
+        parts.append(timing)
+
+        print(" | ".join(parts), flush=True)
+
+    def finish(self) -> None:
+        if not self.enabled:
+            return
+
+        elapsed = time.time() - self.start_time
+        print(
+            f"  [{self.label}] 완료 | {self.completed:,} batch | "
+            f"소요 {format_duration(elapsed)}",
+            flush=True,
+        )
+
+
+def dataloader_length(dataloader: DataLoader) -> Optional[int]:
+    # batch 수를 모르는 dataloader도 있으므로 실패를 허용한다.
+    try:
+        return len(dataloader)
+    except TypeError:
+        return None
+
+
 def train_one_epoch(
     model: NewsEncoderDecoderTransformer,
     loss_fn: TransformerLoss,
@@ -268,10 +373,18 @@ def train_one_epoch(
     amp_enabled: bool = False,
     amp_dtype: Optional[torch.dtype] = None,
     scaler=None,
+    progress_interval: int = 0,
+    progress_label: str = "Train",
 ) -> Dict[str, float]:
     # training dataset 전체를 한 번 학습
     model.train()
     metrics = create_metric_dict()
+
+    progress = ProgressPrinter(
+        label=progress_label,
+        total=dataloader_length(dataloader),
+        interval=progress_interval,
+    )
 
     for batch in dataloader:
         # Batch → GPU
@@ -342,6 +455,19 @@ def train_one_epoch(
             candidate_labels=candidate_labels,
         )
 
+        # 진행률
+        # .item()은 GPU 동기화를 일으키므로 출력하는 batch에서만 호출한다.
+        if progress.enabled:
+            progress.update(
+                loss_value=(
+                    float(loss_output.total_loss.detach())
+                    if progress.will_print_next()
+                    else None
+                )
+            )
+
+    progress.finish()
+
     return finalize_metrics(
         metrics=metrics,
         loss_fn=loss_fn,
@@ -356,10 +482,18 @@ def evaluate(
     device: torch.device,
     amp_enabled: bool = False,
     amp_dtype: Optional[torch.dtype] = None,
+    progress_interval: int = 0,
+    progress_label: str = "Validation",
 ) -> Dict[str, float]:
     # validation dataset에서 loss와 Top-1 성능 계산
     model.eval()
     metrics = create_metric_dict()
+
+    progress = ProgressPrinter(
+        label=progress_label,
+        total=dataloader_length(dataloader),
+        interval=progress_interval,
+    )
 
     for batch in dataloader:
         # Batch → GPU
@@ -393,6 +527,18 @@ def evaluate(
             model_output=model_output,
             candidate_labels=candidate_labels,
         )
+
+        # 진행률
+        if progress.enabled:
+            progress.update(
+                loss_value=(
+                    float(loss_output.total_loss.detach())
+                    if progress.will_print_next()
+                    else None
+                )
+            )
+
+    progress.finish()
 
     return finalize_metrics(
         metrics=metrics,
@@ -536,6 +682,7 @@ def train(
     amp_dtype: str = "bfloat16",
     save_every_epoch: bool = True,
     save_optimizer_state: bool = True,
+    progress_interval: int = 50,
 ) -> None:
     # train/validation dataset을 이용해 Transformer 전체 학습
     set_seed(seed)
@@ -564,6 +711,14 @@ def train(
         ),
     )
     print("DataLoader workers:", num_workers)
+    print(
+        "Progress        :",
+        (
+            f"{progress_interval} batch마다 출력"
+            if progress_interval > 0
+            else "disabled"
+        ),
+    )
     print(
         "Checkpoint      :",
         (
@@ -683,6 +838,8 @@ def train(
         device=device,
         amp_enabled=amp_enabled,
         amp_dtype=resolved_amp_dtype,
+        progress_interval=progress_interval,
+        progress_label="Validation 0/%d" % num_epochs,
     )
 
     print_metrics(
@@ -730,6 +887,8 @@ def train(
             amp_enabled=amp_enabled,
             amp_dtype=resolved_amp_dtype,
             scaler=scaler,
+            progress_interval=progress_interval,
+            progress_label=f"Train {epoch}/{num_epochs}",
         )
 
         print_metrics(
@@ -745,6 +904,8 @@ def train(
             device=device,
             amp_enabled=amp_enabled,
             amp_dtype=resolved_amp_dtype,
+            progress_interval=progress_interval,
+            progress_label=f"Validation {epoch}/{num_epochs}",
         )
 
         print_metrics(

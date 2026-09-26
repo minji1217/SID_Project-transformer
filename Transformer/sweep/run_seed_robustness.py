@@ -153,6 +153,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--accept-auto", action="store_true")
     parser.add_argument("--fail-fast", action="store_true")
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help=(
+            "학습 출력을 화면에 흘리지 않고 train_log.txt에만 남긴다. "
+            "기본은 화면에도 함께 출력한다."
+        ),
+    )
     parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
 
@@ -342,6 +350,7 @@ def main() -> int:
                     "config_index": item["config_index"],
                     "source_fingerprint": fingerprint,
                 },
+                stream_output=(not args.quiet),
             )
 
             if record is not None:
