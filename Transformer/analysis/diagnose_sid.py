@@ -108,6 +108,65 @@ def report_identifiability(df: pd.DataFrame, name: str) -> None:
     print("  서로 다른 기사 수보다 이 값이 훨씬 작으면 그만큼 구분이 불가능하다.")
 
 
+def report_information_content(df: pd.DataFrame, name: str) -> None:
+    """SID가 기사를 얼마나 세밀하게 구분하는지 잰다.
+
+    impression 안에서 후보끼리 (c1,c2,c3)가 겹치지 않더라도,
+    전체 코퍼스에서 SID가 너무 거친 클러스터면
+    모델은 "이 사용자는 어떤 주제를 좋아한다"까지만 배우고
+    그 주제 안의 어느 기사인지는 고를 수 없다.
+    그 경우 성능의 상한은 SID의 해상도가 정한다.
+    """
+    section(f"2b. SID 해상도 / 정보량  [{name}]")
+
+    candidates = stack_candidates(df)
+    labels = labels_array(df)
+    keys = triple_keys(candidates)
+
+    rows = np.arange(len(keys))
+    positive_keys = keys[rows, labels.argmax(axis=1)]
+
+    counts = Counter(positive_keys.tolist())
+    freqs = np.array(sorted(counts.values(), reverse=True), dtype=np.float64)
+    probs = freqs / freqs.sum()
+
+    entropy = float(-(probs * np.log2(probs)).sum())
+    n_distinct = len(freqs)
+
+    print(f"  positive로 등장한 서로 다른 (c1,c2,c3) : {n_distinct:,}개")
+    print(f"  positive 총 개수                       : {len(positive_keys):,}개")
+    print()
+    print(f"  엔트로피          : {entropy:.2f} bits")
+    print(f"  균등분포였다면    : {np.log2(n_distinct):.2f} bits")
+    print(f"  유효 SID 개수     : {2 ** entropy:,.0f}개  (2^엔트로피)")
+    print()
+    print("  '유효 SID 개수'는 실제로 구분에 쓰이는 SID의 수다.")
+    print("  기사 수보다 훨씬 작으면 SID가 그만큼 뭉뚱그려진 것이다.")
+    print()
+
+    # 상위 몇 개의 SID가 positive의 몇 %를 차지하는지
+    cumulative = np.cumsum(probs)
+    print("  상위 SID가 차지하는 positive 비율")
+    for k in (10, 50, 100, 500, 1000):
+        if k <= n_distinct:
+            print(f"    상위 {k:>5}개 : {cumulative[k - 1]:.1%}")
+
+    # 단계별 엔트로피
+    print()
+    print("  단계별 엔트로피 (positive 기준)")
+    positive_sids = candidates[rows, labels.argmax(axis=1)]
+    for level, col in enumerate(CAND_LEVELS):
+        values = positive_sids[:, level]
+        level_counts = np.bincount(values)
+        level_probs = level_counts[level_counts > 0] / len(values)
+        level_entropy = float(-(level_probs * np.log2(level_probs)).sum())
+        used = int((level_counts > 0).sum())
+        print(
+            f"    {col:<14} {level_entropy:>5.2f} bits | "
+            f"사용 코드 {used:>4}개 | 균등이면 {np.log2(used):>5.2f} bits"
+        )
+
+
 def report_collisions(df: pd.DataFrame, name: str) -> None:
     section(f"3. impression 내부 충돌 + 이론적 상한  [{name}]")
 
@@ -229,6 +288,7 @@ def main() -> int:
 
     report_codebook_usage(train_df, "train")
     report_identifiability(train_df, "train")
+    report_information_content(train_df, "train")
     report_collisions(train_df, "train")
     report_collisions(val_df, "validation")
     report_popularity_baseline(train_df, val_df)
