@@ -24,7 +24,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -45,6 +44,13 @@ HISTORY_COLUMNS = [
 # Dataset이 history를 잘라 쓰는 길이. 모델이 실제로 보는 범위에 맞춘다.
 DEFAULT_MAX_HISTORY = 50
 
+# (c1,c2,c3,c4)를 int64 키 하나로 접는다. 각 코드가 1000 미만이라 안전하다.
+# 문자열 키를 쓰면 history 위치 1,000만 개에서 메모리가 터진다.
+RADIX = 1000
+
+# 한 번에 펴는 impression 수
+DEFAULT_CHUNK_SIZE = 20_000
+
 
 def section(title: str) -> None:
     print()
@@ -62,144 +68,200 @@ def pct(part: int, whole: int) -> float:
     return 100.0 * part / whole if whole else float("nan")
 
 
-def analyse(path: Path, name: str, max_history: Optional[int]) -> Dict[str, Any]:
+def encode_articles(
+    values: np.ndarray, mapping: Dict[Any, int]
+) -> np.ndarray:
+    """article_id를 int64 코드로 바꾼다.
+
+    숫자면 그대로 쓰고, 문자열이면 누적 사전으로 매핑한다.
+    문자열 배열을 1,000만 개씩 들고 있으면 메모리가 터지므로
+    chunk마다 바로 정수로 바꾼다.
+    """
+    if np.issubdtype(values.dtype, np.number):
+        return values.astype(np.int64)
+
+    out = np.empty(len(values), dtype=np.int64)
+
+    for i, value in enumerate(values):
+        code = mapping.get(value)
+
+        if code is None:
+            code = len(mapping)
+            mapping[value] = code
+
+        out[i] = code
+
+    return out
+
+
+def analyse(
+    path: Path, name: str, max_history: Optional[int], chunk_size: int
+) -> Dict[str, Any]:
     section(f"{name}  —  {path.name}")
 
     df = pd.read_parquet(path, columns=HISTORY_COLUMNS)
+    num_impressions = len(df)
 
-    print(f"  impression {len(df):,}개")
+    print(f"  impression {num_impressions:,}개")
 
     if max_history:
         print(f"  history는 뒤에서 {max_history}개만 봅니다 "
               f"(NewsSequenceDataset와 동일)")
 
-    # 1) 전체 history 위치를 편다
-    article_chunks: List[np.ndarray] = []
-    triple_chunks: List[np.ndarray] = []
-    quad_chunks: List[np.ndarray] = []
-    impression_chunks: List[np.ndarray] = []
+    # 전부 int64로 편다. 문자열 키를 쓰면 이 규모에서 메모리가 터진다.
+    impression_parts: List[np.ndarray] = []
+    article_parts: List[np.ndarray] = []
+    triple_parts: List[np.ndarray] = []
+    quad_parts: List[np.ndarray] = []
 
-    lengths: List[int] = []
+    article_mapping: Dict[Any, int] = {}
+    total_length = 0
+    empty_histories = 0
 
-    for index, row in enumerate(df.itertuples(index=False)):
-        ids = np.asarray(row.history_article_ids)
-        c1 = np.asarray(row.history_c1)
-        c2 = np.asarray(row.history_c2)
-        c3 = np.asarray(row.history_c3)
-        c4 = np.asarray(row.history_c4)
+    print("  펴는 중...", flush=True)
 
-        if max_history:
-            ids, c1, c2, c3, c4 = (
-                a[-max_history:] for a in (ids, c1, c2, c3, c4)
-            )
+    for start in range(0, num_impressions, chunk_size):
+        block = df.iloc[start:start + chunk_size]
 
-        length = len(c1)
+        ids_list, c1_list, c2_list, c3_list, c4_list = [], [], [], [], []
+        index_list = []
 
-        if length == 0:
-            lengths.append(0)
+        for offset, row in enumerate(block.itertuples(index=False)):
+            c1 = np.asarray(row.history_c1)
+
+            if max_history and len(c1) > max_history:
+                sl = slice(-max_history, None)
+            else:
+                sl = slice(None)
+
+            c1 = c1[sl]
+            length = len(c1)
+
+            if length == 0:
+                empty_histories += 1
+                continue
+
+            ids_list.append(np.asarray(row.history_article_ids)[sl])
+            c1_list.append(c1)
+            c2_list.append(np.asarray(row.history_c2)[sl])
+            c3_list.append(np.asarray(row.history_c3)[sl])
+            c4_list.append(np.asarray(row.history_c4)[sl])
+            index_list.append(np.full(length, start + offset, dtype=np.int64))
+
+        if not c1_list:
             continue
 
-        lengths.append(length)
+        c1 = np.concatenate(c1_list).astype(np.int64)
+        c2 = np.concatenate(c2_list).astype(np.int64)
+        c3 = np.concatenate(c3_list).astype(np.int64)
+        c4 = np.concatenate(c4_list).astype(np.int64)
 
-        article_chunks.append(ids.astype(str))
-        triple_chunks.append(np.char.add(np.char.add(
-            np.char.add(c1.astype(str), "_"),
-            np.char.add(c2.astype(str), "_")), c3.astype(str)))
-        quad_chunks.append(np.char.add(np.char.add(
-            triple_chunks[-1], "_"), c4.astype(str)))
-        impression_chunks.append(np.full(length, index))
+        triple = (c1 * RADIX + c2) * RADIX + c3
+        quad = triple * RADIX + c4
 
-    articles = np.concatenate(article_chunks)
-    triples = np.concatenate(triple_chunks)
-    quads = np.concatenate(quad_chunks)
-    impressions = np.concatenate(impression_chunks)
+        triple_parts.append(triple)
+        quad_parts.append(quad)
+        impression_parts.append(np.concatenate(index_list))
+        article_parts.append(
+            encode_articles(np.concatenate(ids_list), article_mapping)
+        )
+
+        total_length += len(c1)
+
+        done = min(start + chunk_size, num_impressions)
+
+        if done % (chunk_size * 5) == 0 or done == num_impressions:
+            print(f"    {done:,}/{num_impressions:,}  "
+                  f"({100.0 * done / num_impressions:5.1f}%)  "
+                  f"위치 {total_length:,}개", flush=True)
+
+    del df
+
+    impressions = np.concatenate(impression_parts)
+    articles = np.concatenate(article_parts)
+    triples = np.concatenate(triple_parts)
+    quads = np.concatenate(quad_parts)
+
+    del impression_parts, article_parts, triple_parts, quad_parts
 
     total_positions = len(articles)
 
     print(f"  history article 위치 {total_positions:,}개 "
-          f"(impression당 평균 {np.mean(lengths):.1f}개)")
+          f"(impression당 평균 {total_positions / num_impressions:.1f}개)")
 
-    # 4) distinct 수
-    distinct_quad = len(np.unique(quads))
-    distinct_triple = len(np.unique(triples))
-    distinct_article = len(np.unique(articles))
+    if empty_histories:
+        print(f"  history가 비어 있는 impression {empty_histories:,}개는 제외했습니다.")
 
-    section_4 = {
-        "distinct_article_id": distinct_article,
-        "distinct_c1234": distinct_quad,
-        "distinct_c123": distinct_triple,
-        "collapsed_identities": distinct_quad - distinct_triple,
-        "collapse_ratio": pct(distinct_quad - distinct_triple, distinct_quad),
-    }
+    print("  집계 중...", flush=True)
 
-    # 2) triple -> distinct article 수
-    triple_to_articles: Dict[str, set] = defaultdict(set)
+    distinct_quad = int(len(np.unique(quads)))
+    distinct_triple = int(len(np.unique(triples)))
+    distinct_article = int(len(np.unique(articles)))
 
-    for triple, article in zip(triples, articles):
-        triple_to_articles[triple].add(article)
+    del quads
 
-    colliding_triples = {
-        triple for triple, group in triple_to_articles.items()
-        if len(group) > 1
-    }
+    # triple별 distinct article 수 — pandas로 벡터 연산한다
+    pairs = pd.DataFrame({"triple": triples, "article": articles})
+    unique_pairs = pairs.drop_duplicates()
 
-    # 1) collision triple에 속한 위치 수
-    is_colliding = np.fromiter(
-        (triple in colliding_triples for triple in triples),
-        dtype=bool, count=total_positions,
-    )
+    per_triple = unique_pairs.groupby("triple", sort=False)["article"].size()
+    colliding_triple_ids = per_triple.index[per_triple.to_numpy() > 1].to_numpy()
 
+    is_colliding = np.isin(triples, colliding_triple_ids)
     colliding_positions = int(is_colliding.sum())
 
-    # 3) collision group에 속한 distinct article 수
-    colliding_articles = set()
-    for triple in colliding_triples:
-        colliding_articles |= triple_to_articles[triple]
-
-    # 2') 한 impression 안에서 실제로 부딪히는 경우
-    within: Dict[int, Dict[str, set]] = defaultdict(lambda: defaultdict(set))
-
-    for impression, triple, article in zip(impressions, triples, articles):
-        within[int(impression)][triple].add(article)
-
-    impressions_with_clash = sum(
-        1 for groups in within.values()
-        if any(len(group) > 1 for group in groups.values())
+    colliding_articles = int(
+        unique_pairs.loc[
+            unique_pairs["triple"].isin(colliding_triple_ids), "article"
+        ].nunique()
     )
 
-    clashing_pairs = sum(
-        len(group) - 1
-        for groups in within.values()
-        for group in groups.values()
-        if len(group) > 1
+    del pairs, unique_pairs
+
+    # 한 impression 안에서 실제로 부딪히는 경우
+    within = pd.DataFrame({
+        "impression": impressions,
+        "triple": triples,
+        "article": articles,
+    }).drop_duplicates()
+
+    per_group = within.groupby(["impression", "triple"], sort=False).size()
+    clashing = per_group[per_group.to_numpy() > 1]
+
+    impressions_with_clash = int(
+        clashing.index.get_level_values("impression").nunique()
     )
+    clashing_pairs = int((clashing.to_numpy() - 1).sum())
+
+    del within, per_group, clashing, impressions, triples, articles
 
     result = {
         "split": name,
         "path": str(path),
         "max_history": max_history,
-        "impressions": int(len(df)),
+        "impressions": num_impressions,
         "history_positions": total_positions,
-        "mean_history_length": float(np.mean(lengths)),
+        "mean_history_length": total_positions / num_impressions,
 
         "colliding_positions": colliding_positions,
         "colliding_positions_pct": pct(colliding_positions, total_positions),
 
         "impressions_with_within_history_clash": impressions_with_clash,
         "impressions_with_within_history_clash_pct":
-            pct(impressions_with_clash, len(df)),
+            pct(impressions_with_clash, num_impressions),
         "within_history_clashing_articles": clashing_pairs,
 
         "distinct_articles": distinct_article,
-        "colliding_articles": len(colliding_articles),
-        "colliding_articles_pct": pct(len(colliding_articles), distinct_article),
+        "colliding_articles": colliding_articles,
+        "colliding_articles_pct": pct(colliding_articles, distinct_article),
 
-        "colliding_triples": len(colliding_triples),
-        "distinct_triples": distinct_triple,
-        **section_4,
+        "colliding_triples": int(len(colliding_triple_ids)),
+        "distinct_c1234": distinct_quad,
+        "distinct_c123": distinct_triple,
+        "collapsed_identities": distinct_quad - distinct_triple,
+        "collapse_ratio": pct(distinct_quad - distinct_triple, distinct_quad),
     }
 
-    # 출력
     print()
     print("  1) 같은 c123을 여러 article_id가 공유하는 history 위치")
     print(f"       {colliding_positions:,} / {total_positions:,}  "
@@ -207,23 +269,23 @@ def analyse(path: Path, name: str, max_history: Optional[int]) -> Dict[str, Any]
 
     print()
     print("  2) 한 history 안에서 서로 다른 article이 같은 c123으로 겹치는 impression")
-    print(f"       {impressions_with_clash:,} / {len(df):,}  "
+    print(f"       {impressions_with_clash:,} / {num_impressions:,}  "
           f"({result['impressions_with_within_history_clash_pct']:.2f}%)")
     print(f"       겹쳐서 사라지는 article 수: {clashing_pairs:,}")
     print("       <- c4를 빼면 이 경우에만 실제로 정보가 없어집니다.")
 
     print()
     print("  3) collision group에 속한 article (전체 distinct 대비)")
-    print(f"       {len(colliding_articles):,} / {distinct_article:,}  "
+    print(f"       {colliding_articles:,} / {distinct_article:,}  "
           f"({result['colliding_articles_pct']:.2f}%)")
 
     print()
     print("  4) c4 제거 전후 distinct 수")
-    print(f"       distinct article_id : {distinct_article:>10,}")
-    print(f"       distinct c1234      : {distinct_quad:>10,}")
-    print(f"       distinct c123       : {distinct_triple:>10,}")
-    print(f"       줄어든 identity     : {section_4['collapsed_identities']:>10,}  "
-          f"({section_4['collapse_ratio']:.2f}%)")
+    print(f"       distinct article_id : {distinct_article:>12,}")
+    print(f"       distinct c1234      : {distinct_quad:>12,}")
+    print(f"       distinct c123       : {distinct_triple:>12,}")
+    print(f"       줄어든 identity     : {result['collapsed_identities']:>12,}  "
+          f"({result['collapse_ratio']:.2f}%)")
 
     return result
 
@@ -273,6 +335,7 @@ def main() -> int:
         default="sweep_out/ebnerd_v2/priority2_direct/c4_collision_stats",
     )
     parser.add_argument("--max-history", type=int, default=DEFAULT_MAX_HISTORY)
+    parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
 
     args = parser.parse_args()
 
@@ -297,7 +360,9 @@ def main() -> int:
             print(f"\n{label} parquet이 없습니다: {path}")
             return 1
 
-        results.append(analyse(path, label, args.max_history))
+        results.append(
+            analyse(path, label, args.max_history, args.chunk_size)
+        )
 
     interpret(results)
 
