@@ -497,11 +497,203 @@ def report_baselines(
 
 # ----------------------------------------------------------------------
 
+# ----------------------------------------------------------------------
+# 0. 사용 가능한 컬럼
+# ----------------------------------------------------------------------
+
+ARTICLE_ID_COLUMNS = (
+    "candidate_article_ids",
+    "target_article_ids",
+    "history_article_ids",
+)
+
+
+def report_columns(df: pd.DataFrame, name: str) -> None:
+    section(f"0. parquet 컬럼  [{name}]")
+
+    for col in df.columns:
+        print(f"  {col}")
+
+    print()
+    found = [c for c in ARTICLE_ID_COLUMNS if c in df.columns]
+
+    if found:
+        print(f"  기사 ID 컬럼 발견: {', '.join(found)}")
+    else:
+        print("  기사 ID 컬럼이 없습니다.")
+        print("  삼중항당 기사 수는 history의 (c1,c2,c3,c4)로 근사합니다.")
+
+
+# ----------------------------------------------------------------------
+# 1~2. 기사 ID 기준 삼중항 다중도
+# ----------------------------------------------------------------------
+
+def report_article_multiplicity(df: pd.DataFrame, name: str) -> None:
+    section(f"1-2. 기사 ID 기준 (c1,c2,c3) 매핑 분포  [{name}]")
+
+    if "candidate_article_ids" not in df.columns:
+        print("  candidate_article_ids 컬럼이 없어 계산할 수 없습니다.")
+        print("  섹션 5(history c4 기준)를 대신 보세요.")
+        return
+
+    candidates = stack_candidates(df)
+    keys = prefix_keys(candidates, 3).reshape(-1)
+
+    article_ids = np.concatenate(
+        [np.asarray(v).reshape(-1) for v in df["candidate_article_ids"].to_numpy()]
+    )
+
+    if len(article_ids) != len(keys):
+        print(f"  기사 ID 개수({len(article_ids):,})와 "
+              f"candidate 슬롯 수({len(keys):,})가 다릅니다. 건너뜁니다.")
+        return
+
+    # 문자열 ID일 수 있으므로 정수 코드로 factorize
+    codes, uniques = pd.factorize(article_ids)
+
+    n_articles = len(uniques)
+    n_triples = len(np.unique(keys))
+
+    print(f"  고유 candidate 기사 ID : {n_articles:,}개")
+    print(f"  고유 (c1,c2,c3)        : {n_triples:,}개")
+    print(f"  압축비                 : {n_articles / max(n_triples, 1):.1f} 기사 / 삼중항")
+    print()
+
+    # 삼중항별 서로 다른 기사 수
+    pairs = np.unique(np.stack([keys, codes], axis=1), axis=0)
+    triples_of_pairs = pairs[:, 0]
+    _, per_triple = np.unique(triples_of_pairs, return_counts=True)
+
+    print(f"  삼중항당 기사 수   평균 {per_triple.mean():.2f} | "
+          f"중앙값 {int(np.median(per_triple))} | "
+          f"최대 {per_triple.max()} | 최소 {per_triple.min()}")
+    print()
+    print("  분위수")
+    for q in (50, 75, 90, 95, 99):
+        print(f"    {q:>2}% : {np.percentile(per_triple, q):.0f}개")
+
+    print()
+    print("  분포")
+    dist = Counter(per_triple.tolist())
+    shown = 0
+    for k in sorted(dist):
+        if shown < 12 or k == max(dist):
+            n = dist[k]
+            print(f"    {k:>4}개 기사 : {n:>7,} 삼중항 ({n / len(per_triple):>6.1%})")
+            shown += 1
+
+    collapsed = int((per_triple > 1).sum())
+    print()
+    print(f"  기사 2개 이상이 같은 삼중항 : {collapsed:,} / {len(per_triple):,} "
+          f"({collapsed / len(per_triple):.1%})")
+    print()
+    print("  candidate는 (c1,c2,c3)만 쓰므로, 같은 삼중항의 기사들은")
+    print("  모델이 원리적으로 구분할 수 없다. 압축비가 클수록 상한이 낮다.")
+
+
+# ----------------------------------------------------------------------
+# 7. popularity baseline 원인 규명
+# ----------------------------------------------------------------------
+
+def report_popularity_diagnosis(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+) -> None:
+    section("7. popularity baseline 진단")
+
+    print("  계산 방식")
+    print("    1) train의 각 impression에서 positive의 (c1,c2,c3)를 센다")
+    print("    2) validation의 후보 5개에 그 횟수를 점수로 매긴다")
+    print("    3) 동점은 평균 순위로 처리한다")
+    print()
+
+    train_candidates = stack_candidates(train_df)
+    train_labels = labels_array(train_df)
+    train_keys = prefix_keys(train_candidates, 3)
+    train_rows = np.arange(len(train_keys))
+    train_pos_keys = train_keys[train_rows, positive_index(train_labels)]
+
+    counter = Counter(train_pos_keys.tolist())
+
+    val_candidates = stack_candidates(val_df)
+    val_labels = labels_array(val_df)
+    val_keys = prefix_keys(val_candidates, 3)
+    val_rows = np.arange(len(val_keys))
+    pos = positive_index(val_labels)
+
+    scores = np.vectorize(lambda k: counter.get(int(k), 0))(val_keys).astype(np.float64)
+
+    positive_scores = scores[val_rows, pos]
+    negative_mask = np.ones(scores.shape, dtype=bool)
+    negative_mask[val_rows, pos] = False
+    negative_scores = scores[negative_mask].reshape(len(val_df), 4)
+
+    print("  validation 후보의 popularity 점수")
+    print(f"    정답 평균 {positive_scores.mean():>10.1f} | "
+          f"중앙값 {np.median(positive_scores):>8.1f} | "
+          f"0인 비율 {(positive_scores == 0).mean():>6.1%}")
+    print(f"    오답 평균 {negative_scores.mean():>10.1f} | "
+          f"중앙값 {np.median(negative_scores):>8.1f} | "
+          f"0인 비율 {(negative_scores == 0).mean():>6.1%}")
+    print()
+
+    if negative_scores.mean() > positive_scores.mean():
+        print("  >>> 오답이 정답보다 인기가 높습니다.")
+        print("      negative가 노출 많은 기사에서 뽑혔다는 신호입니다.")
+        print("      이 경우 popularity는 오답을 가리키므로 AUC가 0.5 아래로 갑니다.")
+    else:
+        print("  >>> 정답이 오답보다 인기가 높습니다.")
+
+    print()
+
+    # 동점 구조
+    all_same = (scores == scores[:, :1]).all(axis=1)
+    all_zero = (scores == 0).all(axis=1)
+    print(f"  후보 5개 점수가 모두 같은 impression : "
+          f"{all_same.mean():.1%}  (그중 모두 0인 경우 {all_zero.mean():.1%})")
+    print("    이런 impression은 무작위와 같아 0.2 / AUC 0.5로 기여합니다.")
+    print()
+
+    # train에 없던 SID
+    unseen = ~np.isin(val_keys[val_rows, pos], np.array(list(counter.keys())))
+    print(f"  validation 정답 SID가 train positive에 없던 비율 : {unseen.mean():.1%}")
+    print("    높으면 train/validation이 시간으로 갈렸고 SID 분포가 이동한 것입니다.")
+    print()
+
+    # 대안: 노출 기준 popularity
+    exposure = Counter(train_keys.reshape(-1).tolist())
+    exposure_scores = np.vectorize(
+        lambda k: exposure.get(int(k), 0)
+    )(val_keys).astype(np.float64)
+
+    print("  다른 정의로 다시 계산")
+    print_metrics("positive 빈도 기준", score_metrics(scores, val_labels))
+    print_metrics("노출(전체 슬롯) 기준", score_metrics(exposure_scores, val_labels))
+    print_metrics("부호 반전", score_metrics(-scores, val_labels))
+    print()
+
+    # metric 코드 자체의 sanity check
+    rng = np.random.default_rng(0)
+    random_scores = rng.random(scores.shape)
+    shuffled = score_metrics(random_scores, val_labels)
+
+    print("  metric 코드 sanity check (무작위 점수)")
+    print_metrics("무작위 점수", shuffled)
+    print(f"    기대값: Top-1 {RANDOM_TOP1:.4f} | MRR {RANDOM_MRR:.4f} | "
+          f"nDCG@5 {RANDOM_NDCG5:.4f} | AUC {RANDOM_AUC:.4f}")
+    print("    이 두 줄이 일치하면 metric 계산 자체는 정상입니다.")
+
+
 def run_all(train_df: pd.DataFrame, val_df: pd.DataFrame) -> None:
+    report_columns(train_df, "train")
+
     report_codebook_usage(train_df, "train")
     report_codebook_usage(val_df, "validation")
 
+    report_article_multiplicity(train_df, "train")
+
     report_information_content(train_df, "train")
+    report_information_content(val_df, "validation")
 
     report_prefix_collisions(train_df, "train")
     report_prefix_collisions(val_df, "validation")
@@ -512,6 +704,7 @@ def run_all(train_df: pd.DataFrame, val_df: pd.DataFrame) -> None:
     val_overlap = report_history_overlap(val_df, "validation")
 
     report_baselines(train_df, val_df, val_overlap)
+    report_popularity_diagnosis(train_df, val_df)
 
 
 def main() -> int:
