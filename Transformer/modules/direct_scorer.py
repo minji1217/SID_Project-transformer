@@ -43,8 +43,10 @@ from modules.model import NewsEncoderDecoderTransformer
 NUM_CANDIDATE_SID_LEVELS = 3
 NUM_CANDIDATES = 5
 
-# history 기사 하나가 차지하는 code token 수 (use_sep=False 기준)
-TOKENS_PER_ARTICLE = 4
+# history 기사 하나가 차지하는 code token 수 (use_sep=False 기준).
+# history_levels로 정한다. 4면 c1c2c3c4, 3이면 c1c2c3.
+DEFAULT_HISTORY_LEVELS = 4
+VALID_HISTORY_LEVELS = (3, 4)
 
 SCORER_TYPES = ("bilinear", "mlp")
 
@@ -121,8 +123,15 @@ class DirectScorer(nn.Module):
         scorer_type: str = "bilinear",
         mlp_hidden: int = 256,
         mlp_dropout: float = 0.0,
+        history_levels: int = DEFAULT_HISTORY_LEVELS,
     ) -> None:
         super().__init__()
+
+        if history_levels not in VALID_HISTORY_LEVELS:
+            raise ValueError(
+                f"history_levels는 {VALID_HISTORY_LEVELS} 중 하나여야 합니다: "
+                f"{history_levels}"
+            )
 
         if scorer_type not in SCORER_TYPES:
             raise ValueError(
@@ -138,6 +147,7 @@ class DirectScorer(nn.Module):
 
         self.backbone = backbone
         self.scorer_type = scorer_type
+        self.history_levels = history_levels
         self.d_model = backbone.d_model
 
         d = self.d_model
@@ -170,22 +180,37 @@ class DirectScorer(nn.Module):
 
     # ------------------------------------------------------------ parameters
 
+    def unused_prefixes(self) -> Tuple[str, ...]:
+        """이 설정에서 forward가 쓰지 않는 backbone parameter."""
+        prefixes = UNUSED_BACKBONE_PREFIXES
+
+        if self.history_levels == 3:
+            # history에서 c4를 빼면 c4_embedding이 어디에도 쓰이지 않는다.
+            # candidate도 c1/c2/c3만 쓴다.
+            prefixes = prefixes + ("c4_embedding.",)
+
+        return prefixes
+
     def freeze_unused_backbone(self) -> List[str]:
-        """forward에서 안 쓰는 decoder 계열을 학습에서 뺀다."""
+        """forward에서 안 쓰는 parameter를 학습에서 뺀다."""
         frozen: List[str] = []
+        prefixes = self.unused_prefixes()
 
         for name, param in self.backbone.named_parameters():
-            if name.startswith(UNUSED_BACKBONE_PREFIXES):
+            if name.startswith(prefixes):
                 param.requires_grad = False
                 frozen.append(name)
 
         return frozen
 
     def backbone_trainable_parameters(self) -> List[Tuple[str, nn.Parameter]]:
+        unused = self.unused_prefixes()
+
         return [
             (f"backbone.{name}", param)
             for name, param in self.backbone.named_parameters()
             if name.startswith(BACKBONE_TRAINABLE_PREFIXES)
+            and not name.startswith(unused)
         ]
 
     def new_parameters(self) -> List[Tuple[str, nn.Parameter]]:
@@ -196,31 +221,91 @@ class DirectScorer(nn.Module):
         ]
 
     def unused_parameters(self) -> List[Tuple[str, nn.Parameter]]:
+        prefixes = self.unused_prefixes()
+
         return [
             (f"backbone.{name}", param)
             for name, param in self.backbone.named_parameters()
-            if name.startswith(UNUSED_BACKBONE_PREFIXES)
+            if name.startswith(prefixes)
         ]
 
     # ------------------------------------------------------------ forward
 
+    def embed_history(self, history_sids: Tensor) -> Tensor:
+        """history code를 embedding으로 바꾼다. -> [B, H, L, d]
+
+        history_levels=3이면 c4를 아예 읽지 않는다. encoder에 넣고
+        나중에 평균에서만 빼면 self-attention 단계에서 c4 정보가 이미
+        c1/c2/c3 hidden state에 섞여서 ablation이 되지 않는다.
+        """
+        if history_sids.ndim != 3:
+            raise ValueError(
+                "history_sids must have shape [B,H,4]. "
+                f"Received: {tuple(history_sids.shape)}"
+            )
+
+        embeddings = [
+            self.backbone.c1_embedding(history_sids[:, :, 0]),
+            self.backbone.c2_embedding(history_sids[:, :, 1]),
+            self.backbone.c3_embedding(history_sids[:, :, 2]),
+        ]
+
+        if self.history_levels == 4:
+            embeddings.append(self.backbone.c4_embedding(history_sids[:, :, 3]))
+
+        # [B, H, L, d]
+        return torch.stack(embeddings, dim=2)
+
+    def expand_mask(self, history_mask: Tensor) -> Tensor:
+        """기사 단위 mask를 code token 단위로 늘린다. -> [B, H*L]"""
+        return history_mask.unsqueeze(-1).expand(
+            -1, -1, self.history_levels
+        ).reshape(history_mask.shape[0], -1)
+
+    def run_encoder(
+        self, history_sids: Tensor, history_mask: Tensor
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """[B, H, L, d] -> flatten -> encoder -> [B, H*L, d]
+
+        backbone.encode()를 쓰지 않는다. 그쪽은 c1~c4를 항상 넣기
+        때문이다. embedding과 encoder는 backbone 것을 그대로 쓴다.
+        """
+        article_embeddings = self.embed_history(history_sids)
+
+        batch_size, history_length, levels, d_model = article_embeddings.shape
+
+        encoder_inputs = article_embeddings.reshape(
+            batch_size, history_length * levels, d_model
+        )
+
+        encoder_mask = self.expand_mask(history_mask).long()
+
+        encoder_outputs = self.backbone.encoder(
+            inputs_embeds=encoder_inputs,
+            attention_mask=encoder_mask,
+            return_dict=True,
+        )
+
+        return (
+            encoder_outputs.last_hidden_state,
+            encoder_inputs,
+            article_embeddings,
+        )
+
     def encode_user(
         self, history_sids: Tensor, history_mask: Tensor
     ) -> Tuple[Tensor, Tensor]:
-        encoder_output = self.backbone.encode(
-            history_sids=history_sids, history_mask=history_mask
-        )
+        hidden, _, _ = self.run_encoder(history_sids, history_mask)
 
-        hidden = encoder_output.hidden_states          # [B, H*4, d]
         batch_size, seq_len, d_model = hidden.shape
 
-        if seq_len % TOKENS_PER_ARTICLE != 0:
+        if seq_len % self.history_levels != 0:
             raise ValueError(
                 f"encoder 출력 길이 {seq_len}이 "
-                f"{TOKENS_PER_ARTICLE}의 배수가 아닙니다."
+                f"{self.history_levels}의 배수가 아닙니다."
             )
 
-        history_length = seq_len // TOKENS_PER_ARTICLE
+        history_length = seq_len // self.history_levels
 
         if history_length != history_mask.shape[1]:
             raise ValueError(
@@ -228,14 +313,55 @@ class DirectScorer(nn.Module):
                 f"mask {history_mask.shape[1]}"
             )
 
-        # [B, H*4, d] -> [B, H, 4, d] -> c1/c2/c3/c4 평균 -> [B, H, d]
+        # [B, H*L, d] -> [B, H, L, d] -> level 평균 -> [B, H, d]
         article_vectors = hidden.view(
-            batch_size, history_length, TOKENS_PER_ARTICLE, d_model
+            batch_size, history_length, self.history_levels, d_model
         ).mean(dim=2)
 
         return masked_attention_pool(
             article_vectors, history_mask, self.pool_proj, self.pool_score
         )
+
+    @torch.no_grad()
+    def describe_shapes(
+        self, history_sids: Tensor, history_mask: Tensor, candidate_sids: Tensor
+    ) -> List[Tuple[str, Tuple[int, ...]]]:
+        """한 batch의 tensor shape를 순서대로 돌려준다."""
+        was_training = self.training
+        self.eval()
+
+        levels = self.history_levels
+
+        raw = history_sids[:, :, :levels]
+        article_embeddings = self.embed_history(history_sids)
+        hidden, encoder_inputs, _ = self.run_encoder(history_sids, history_mask)
+
+        batch_size, seq_len, d_model = hidden.shape
+        history_length = seq_len // levels
+
+        article_vectors = hidden.view(
+            batch_size, history_length, levels, d_model
+        ).mean(dim=2)
+
+        user_vector, _ = masked_attention_pool(
+            article_vectors, history_mask, self.pool_proj, self.pool_score
+        )
+
+        candidate_vectors = self.encode_candidates(candidate_sids)
+        candidate_scores = self.score(user_vector, candidate_vectors)
+
+        self.train(was_training)
+
+        return [
+            ("history raw", tuple(raw.shape)),
+            ("history embedding", tuple(article_embeddings.shape)),
+            ("encoder input", tuple(encoder_inputs.shape)),
+            ("encoder output", tuple(hidden.shape)),
+            ("article vectors", tuple(article_vectors.shape)),
+            ("user vector", tuple(user_vector.shape)),
+            ("candidate vectors", tuple(candidate_vectors.shape)),
+            ("candidate scores", tuple(candidate_scores.shape)),
+        ]
 
     def encode_candidates(self, candidate_sids: Tensor) -> Tensor:
         if candidate_sids.ndim != 3:
@@ -328,6 +454,7 @@ class DirectScorer(nn.Module):
                 "tensors": len(unused),
                 "names": [name for name, _ in unused],
             },
+            "history_levels": self.history_levels,
             "trainable_total": total(backbone_trainable) + total(new),
             "model_total": sum(p.numel() for p in self.parameters()),
         }

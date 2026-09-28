@@ -92,6 +92,13 @@ BASELINES: List[Dict[str, Any]] = [
         "note": "alpha를 Train에서 학습",
     },
     {
+        "config": "P2-A c1234 history",
+        "detail": "direct u^T W v, history = c1c2c3c4",
+        "tuned_on": "Train",
+        "top1_accuracy": 0.26137,
+        "note": "c4 ablation의 직접 비교 대상",
+    },
+    {
         "config": "Fixed weighted grid",
         "detail": "L1 + 0.5*L2 + 0.1*L3",
         "tuned_on": "Validation",
@@ -400,6 +407,75 @@ def print_parameter_report(
         print(f"    backbone.{head}  ({groups[head]} tensor)")
 
 
+def print_shapes(
+    model: DirectScorer,
+    loader: DataLoader,
+    device: torch.device,
+) -> List[Dict[str, Any]]:
+    """학습 전에 한 batch의 tensor shape를 확인한다."""
+    section("tensor shape 확인 (한 batch)")
+
+    batch = next(iter(loader))
+
+    history_sids = batch["history_sids"].to(device)
+    history_mask = batch["history_mask"].to(device)
+    candidate_sids = batch["candidate_sids"].to(device)
+
+    shapes = model.describe_shapes(history_sids, history_mask, candidate_sids)
+
+    batch_size = history_sids.shape[0]
+    history_length = history_mask.shape[1]
+    levels = model.history_levels
+
+    print(f"  B = {batch_size}, H = {history_length} (이 batch의 최대 history 길이), "
+          f"L = {levels}, d_model = {model.d_model}")
+    print()
+
+    expected = {
+        "history raw": (batch_size, history_length, levels),
+        "history embedding": (batch_size, history_length, levels, model.d_model),
+        "encoder input": (batch_size, history_length * levels, model.d_model),
+        "encoder output": (batch_size, history_length * levels, model.d_model),
+        "article vectors": (batch_size, history_length, model.d_model),
+        "user vector": (batch_size, model.d_model),
+        "candidate vectors": (batch_size, NUM_CANDIDATES, model.d_model),
+        "candidate scores": (batch_size, NUM_CANDIDATES),
+    }
+
+    rows: List[Dict[str, Any]] = []
+    all_ok = True
+
+    print(f"  {'단계':<20} {'실제':<24} {'기대':<24}")
+    print("  " + "-" * 74)
+
+    for name, shape in shapes:
+        want = expected[name]
+        ok = shape == want
+        all_ok = all_ok and ok
+
+        rows.append({
+            "stage": name, "actual": list(shape),
+            "expected": list(want), "match": ok,
+        })
+
+        print(f"  {name:<20} {str(shape):<24} {str(want):<24} "
+              f"{'OK' if ok else 'MISMATCH'}")
+
+    print()
+
+    if all_ok:
+        print("  전부 일치합니다.")
+    else:
+        print("  => shape가 기대와 다릅니다. 실행을 중단합니다.")
+
+    if levels == 3:
+        print()
+        print("  history에 c4를 넣지 않습니다. encoder 입력 자체가 [B, H*3, d]이므로")
+        print("  self-attention 단계에서도 c4 정보가 섞이지 않습니다.")
+
+    return rows, all_ok
+
+
 def build_optimizer(model: DirectScorer, learning_rate: float) -> AdamW:
     """학습 대상만 담는다. 쓰지 않는 decoder 계열은 넣지 않는다."""
     params = [
@@ -558,12 +634,17 @@ def offline_metrics(df: pd.DataFrame) -> Dict[str, float]:
 # ---------------------------------------------------------------- 보고
 
 
-def comparison_rows(result: Dict[str, float], scorer_type: str) -> List[Dict[str, Any]]:
+def comparison_rows(
+    result: Dict[str, float], scorer_type: str, history_levels: int
+) -> List[Dict[str, Any]]:
     rows = [dict(row) for row in BASELINES]
 
     rows.append({
-        "config": f"P2-A Direct ({scorer_type})",
-        "detail": "D = u^T W v  (생성확률 미사용)",
+        "config": f"P2-A c{'1234' if history_levels == 4 else '123'} history ({scorer_type})",
+        "detail": (
+            f"direct u^T W v, history = "
+            f"{'c1c2c3c4' if history_levels == 4 else 'c1c2c3'}"
+        ),
         "tuned_on": "Train",
         "top1_accuracy": result["top1_accuracy"],
         "mrr": result["mrr"],
@@ -646,6 +727,16 @@ def write_readme(
     add("    V1 : Decoder -> L1 + L2 + L3")
     add("    P2 : article pooling + candidate projection -> u^T W v")
     add("")
+    add(f"history = `{metadata['history_codes']}`, "
+        f"candidate = `{metadata['candidate_codes']}`")
+    add("")
+
+    if metadata["history_levels"] == 3:
+        add("**c4 ablation.** history 입력 자체를 `[B,H,3]`으로 만들어 c4를")
+        add("encoder에 넣지 않았다. encoder에 넣고 평균에서만 빼면 "
+            "self-attention 단계에서")
+        add("c4 정보가 이미 c1/c2/c3 hidden state에 섞이므로 ablation이 되지 않는다.")
+        add("")
 
     add("## 실행 정보")
     add("")
@@ -694,6 +785,18 @@ def write_readme(
     add("만들지 않으면 그 뒤 `_reset_parameters()`가 보는 RNG 상태가 "
         "달라져 embedding")
     add("초기값이 V1과 어긋나기 때문이다.")
+    add("")
+
+    add("## tensor shape")
+    add("")
+    add("| 단계 | 실제 | 기대 | 판정 |")
+    add("|---|---|---|---|")
+
+    for row in metadata["shape_check"]:
+        verdict = "OK" if row["match"] else "MISMATCH"
+        add(f"| {row['stage']} | {tuple(row['actual'])} | "
+            f"{tuple(row['expected'])} | {verdict} |")
+
     add("")
 
     add("## parameter")
@@ -797,6 +900,10 @@ def main() -> int:
         "--gin-binding", action="append", default=[], metavar="BINDING"
     )
 
+    parser.add_argument(
+        "--history-levels", type=int, default=4, choices=[3, 4],
+        help="4 = history c1c2c3c4 (기본), 3 = history c1c2c3 (c4 ablation)",
+    )
     parser.add_argument("--scorer", default="bilinear", choices=["bilinear", "mlp"])
     parser.add_argument("--mlp-hidden", type=int, default=256)
     parser.add_argument("--mlp-dropout", type=float, default=0.0)
@@ -855,6 +962,8 @@ def main() -> int:
     print(f"  train       : {train_path}")
     print(f"  validation  : {validation_path}")
     print(f"  scorer      : {args.scorer}")
+    print(f"  history     : {'c1c2c3c4' if args.history_levels == 4 else 'c1c2c3  (c4 ablation)'}"
+          f"  ({args.history_levels} level)")
     print(f"  출력        : {out_dir}")
     print(f"  device      : {device}")
     print(f"  gin binding : {len(bindings)}개  (출처: {binding_source})")
@@ -922,6 +1031,7 @@ def main() -> int:
         scorer_type=args.scorer,
         mlp_hidden=args.mlp_hidden,
         mlp_dropout=args.mlp_dropout,
+        history_levels=args.history_levels,
     ).to(device)
 
     init_check = verify_initialization(model, before, args.seed, device)
@@ -932,6 +1042,11 @@ def main() -> int:
     param_report = model.parameter_report()
 
     print_parameter_report(param_report, args.learning_rate)
+
+    shape_rows, shapes_ok = print_shapes(model, train_loader, device)
+
+    if not shapes_ok:
+        return 1
 
     optimizer = build_optimizer(model, args.learning_rate)
     loss_fn = TransformerLoss().to(device)
@@ -1066,7 +1181,9 @@ def main() -> int:
         print(f"  !! 두 경로의 metric이 다릅니다 (최대 {worst:.3e}).")
 
     # ---- 비교
-    comparison = comparison_rows(best["metrics"], args.scorer)
+    comparison = comparison_rows(
+        best["metrics"], args.scorer, args.history_levels
+    )
     print_comparison(comparison)
 
     # ---- 저장
@@ -1095,6 +1212,11 @@ def main() -> int:
     metadata = {
         "experiment": "priority2_direct_scorer",
         "scorer_type": args.scorer,
+        "history_levels": args.history_levels,
+        "history_codes": (
+            "c1,c2,c3,c4" if args.history_levels == 4 else "c1,c2,c3"
+        ),
+        "candidate_codes": "c1,c2,c3",
         "score_formula": (
             "D = u^T W v" if args.scorer == "bilinear"
             else "D = MLP([u, v, u*v, |u-v|])"
@@ -1109,6 +1231,7 @@ def main() -> int:
         "gin_binding_source": binding_source,
         "config_check": config_check,
         "initialization_check": init_check,
+        "shape_check": shape_rows,
         "parameter_report": param_report,
         "optimizer": "AdamW",
         "learning_rate": args.learning_rate,
