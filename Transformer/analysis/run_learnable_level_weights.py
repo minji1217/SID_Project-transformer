@@ -61,7 +61,7 @@ from data.sequence import NewsSequenceDataset, collate_news_sequences
 from evaluate.metrics import evaluate_ranking
 from modules.loss import TransformerLoss
 from modules.model import NewsEncoderDecoderTransformer
-from sweep.run_stage import write_csv
+from sweep.run_stage import format_binding, write_csv
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -239,6 +239,37 @@ def extract_levels(
     })
 
 
+def bindings_from_priority0(
+    p0_meta: Dict[str, Any], extra: Optional[List[str]] = None
+) -> Tuple[List[str], str]:
+    """Priority 0가 쓴 gin override를 그대로 되살린다.
+
+    Priority 0는 두 가지 방식 중 하나로 설정을 기록한다.
+      - selected_final.json 경로로 돌았으면 "config"에 딕셔너리
+      - --checkpoint 경로로 돌았으면 "gin_bindings"에 문자열 목록
+
+    둘 중 채워진 쪽을 쓴다. 한쪽만 보면 모델을 base config 기본값으로
+    만들게 되고, checkpoint와 shape이 달라 load_state_dict가 깨진다.
+    """
+    if extra:
+        return list(extra), "명령행 --gin-binding"
+
+    binding_strings = p0_meta.get("gin_bindings")
+
+    if binding_strings:
+        return list(binding_strings), "Priority 0 run_metadata.json의 gin_bindings"
+
+    config = p0_meta.get("config")
+
+    if config:
+        return (
+            [format_binding(key, config[key]) for key in sorted(config)],
+            "Priority 0 run_metadata.json의 config",
+        )
+
+    return [], "없음 (base config만 사용)"
+
+
 def configure_gin(config_path: Path, bindings: Optional[List[str]]) -> None:
     """gin을 먼저 읽는다.
 
@@ -261,10 +292,21 @@ def build_model(
 
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
-    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        model.load_state_dict(checkpoint["model_state_dict"])
-    else:
-        model.load_state_dict(checkpoint)
+    state = (
+        checkpoint["model_state_dict"]
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint
+        else checkpoint
+    )
+
+    try:
+        model.load_state_dict(state)
+    except RuntimeError as error:
+        raise RuntimeError(
+            "checkpoint와 모델 구조가 맞지 않습니다.\n"
+            "gin override가 제대로 적용되지 않았을 가능성이 큽니다. "
+            "위에 출력된 'gin override 출처'를 확인하세요.\n"
+            f"checkpoint: {checkpoint_path}\n\n{error}"
+        ) from error
 
     # Transformer 전체 freeze
     for param in model.parameters():
@@ -1094,6 +1136,13 @@ def main() -> int:
         help="이미 뽑아둔 train L1/L2/L3 parquet. 있으면 추론을 건너뛴다.",
     )
     parser.add_argument(
+        "--gin-binding", action="append", default=[], metavar="BINDING",
+        help=(
+            "gin override를 직접 지정한다. 주면 Priority 0 metadata의 "
+            "설정 대신 이 값만 쓴다."
+        ),
+    )
+    parser.add_argument(
         "--skip-extractor-check", action="store_true",
         help="validation을 다시 추론해 Priority 0과 대조하는 단계를 건너뛴다.",
     )
@@ -1142,7 +1191,7 @@ def main() -> int:
         args.checkpoint if args.checkpoint else p0_meta["checkpoint"]
     )
     validation_path = resolve_path(p0_meta["dataset"])
-    bindings = p0_meta.get("gin_bindings") or []
+    bindings, binding_source = bindings_from_priority0(p0_meta, args.gin_binding)
 
     scores_path = priority0_dir / "candidate_scores.parquet"
 
@@ -1166,7 +1215,10 @@ def main() -> int:
     print(f"  Priority 0  : {priority0_dir}")
     print(f"  출력        : {out_dir}")
     print(f"  device      : {device}")
-    print(f"  gin binding : {len(bindings)}개")
+    print(f"  gin binding : {len(bindings)}개  (출처: {binding_source})")
+
+    for binding in bindings:
+        print(f"      {binding}")
     print()
     print("  Transformer를 재학습하지 않습니다. Test를 쓰지 않습니다.")
 
@@ -1402,6 +1454,7 @@ def main() -> int:
         "validation_cache": str(scores_path),
         "config": str(config_path),
         "gin_bindings": bindings,
+        "gin_binding_source": binding_source,
         "parameterization": f"alpha = {ALPHA_SUM} * softmax(theta), theta0 = [0,0,0]",
         "constraint": "alpha > 0, alpha1 + alpha2 + alpha3 = 3",
         "transformer_frozen": True,
