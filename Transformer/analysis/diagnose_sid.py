@@ -684,6 +684,82 @@ def report_popularity_diagnosis(
     print("    이 두 줄이 일치하면 metric 계산 자체는 정상입니다.")
 
 
+def report_split_overlap(train_df: pd.DataFrame, val_df: pd.DataFrame) -> None:
+    """train과 validation이 같은 기사/SID를 쓰는지 본다.
+
+    뉴스는 기사가 계속 바뀐다. validation 시점의 기사가 train에 없었다면
+    모델은 기사를 외울 수 없고 SID의 의미 구조로만 일반화해야 한다.
+    그 비율이 성능 상한을 좌우한다.
+    """
+    section("8. train - validation 집합 비교")
+
+    def candidate_sets(df):
+        candidates = stack_candidates(df)
+        labels = labels_array(df)
+        rows = np.arange(len(df))
+        pos = positive_index(labels)
+
+        keys = prefix_keys(candidates, 3)
+
+        out = {
+            "triple_all": set(keys.reshape(-1).tolist()),
+            "triple_pos": set(keys[rows, pos].tolist()),
+        }
+
+        if "candidate_article_ids" in df.columns:
+            ids = np.stack(df["candidate_article_ids"].to_numpy())
+            out["article_all"] = set(ids.reshape(-1).tolist())
+            out["article_pos"] = set(ids[rows, pos].tolist())
+
+        return out
+
+    train_sets = candidate_sets(train_df)
+    val_sets = candidate_sets(val_df)
+
+    rows_out = [
+        ("candidate 전체 (c1,c2,c3)", "triple_all"),
+        ("정답 (c1,c2,c3)", "triple_pos"),
+        ("candidate 전체 기사 ID", "article_all"),
+        ("정답 기사 ID", "article_pos"),
+    ]
+
+    print(f"  {'항목':<26}{'train':>10}{'val':>10}{'공통':>10}"
+          f"{'val 중 신규':>14}")
+    print("  " + "-" * 72)
+
+    for label, key in rows_out:
+        if key not in train_sets or key not in val_sets:
+            continue
+
+        a, b = train_sets[key], val_sets[key]
+        shared = a & b
+        new_in_val = len(b) - len(shared)
+
+        print(
+            f"  {label:<20}{len(a):>10,}{len(b):>10,}{len(shared):>10,}"
+            f"{new_in_val / max(len(b), 1):>14.1%}"
+        )
+
+    print()
+
+    # impression 단위로 보면 몇 %가 새 기사인가
+    if "candidate_article_ids" in val_df.columns:
+        val_candidates = stack_candidates(val_df)
+        val_labels = labels_array(val_df)
+        rows = np.arange(len(val_df))
+        ids = np.stack(val_df["candidate_article_ids"].to_numpy())
+        positive_ids = ids[rows, positive_index(val_labels)]
+
+        train_articles = train_sets.get("article_all", set())
+        unseen = np.array([int(i) not in train_articles for i in positive_ids])
+
+        print(f"  validation impression 중 정답 기사가 train에 아예 없던 비율")
+        print(f"    {unseen.mean():.1%}  ({int(unseen.sum()):,} / {len(unseen):,})")
+        print()
+        print("  이 값이 높으면 모델은 기사를 외울 수 없고")
+        print("  SID의 의미 구조로만 새 기사를 맞혀야 한다.")
+
+
 def run_all(train_df: pd.DataFrame, val_df: pd.DataFrame) -> None:
     report_columns(train_df, "train")
 
@@ -691,6 +767,7 @@ def run_all(train_df: pd.DataFrame, val_df: pd.DataFrame) -> None:
     report_codebook_usage(val_df, "validation")
 
     report_article_multiplicity(train_df, "train")
+    report_article_multiplicity(val_df, "validation")
 
     report_information_content(train_df, "train")
     report_information_content(val_df, "validation")
@@ -699,12 +776,14 @@ def run_all(train_df: pd.DataFrame, val_df: pd.DataFrame) -> None:
     report_prefix_collisions(val_df, "validation")
 
     report_triple_multiplicity(train_df, "train")
+    report_triple_multiplicity(val_df, "validation")
 
     report_history_overlap(train_df, "train")
     val_overlap = report_history_overlap(val_df, "validation")
 
     report_baselines(train_df, val_df, val_overlap)
     report_popularity_diagnosis(train_df, val_df)
+    report_split_overlap(train_df, val_df)
 
 
 def main() -> int:
