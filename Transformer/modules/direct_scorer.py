@@ -48,6 +48,19 @@ NUM_CANDIDATES = 5
 DEFAULT_HISTORY_LEVELS = 4
 VALID_HISTORY_LEVELS = (3, 4)
 
+# article vector를 만드는 방식
+#   mean     : (h1 + h2 + h3 [+ h4]) / L        지금까지의 기본
+#   weighted : (1.0*h1 + 0.5*h2 + 0.1*h3) / 1.6
+#
+# [1, 0.5, 0.1]은 V1의 L1/L2/L3 score weight grid에서 Validation 기준
+# 가장 좋았던 비율이다. embedding 가중치로 최적이라고 증명된 값이
+# 아니다. 그 비율을 고정 가설로 옮겨와 확인하는 것이다.
+HISTORY_MODES = ("mean", "weighted")
+DEFAULT_LEVEL_WEIGHTS = (1.0, 0.5, 0.1)
+
+# c4 identity residual의 세기. 학습하지 않는다.
+DEFAULT_BETA4 = 0.01
+
 SCORER_TYPES = ("bilinear", "mlp")
 
 # checkpoint에는 있지만 Priority 2 forward에서 쓰지 않는 parameter.
@@ -124,8 +137,24 @@ class DirectScorer(nn.Module):
         mlp_hidden: int = 256,
         mlp_dropout: float = 0.0,
         history_levels: int = DEFAULT_HISTORY_LEVELS,
+        history_mode: str = "mean",
+        level_weights: Tuple[float, float, float] = DEFAULT_LEVEL_WEIGHTS,
+        use_c4_identity: bool = False,
+        beta4: float = DEFAULT_BETA4,
     ) -> None:
         super().__init__()
+
+        if history_mode not in HISTORY_MODES:
+            raise ValueError(
+                f"history_mode는 {HISTORY_MODES} 중 하나여야 합니다: "
+                f"{history_mode}"
+            )
+
+        if history_mode == "weighted" and history_levels != 3:
+            raise ValueError(
+                "weighted mode는 history_levels=3에서만 씁니다. "
+                "c4는 encoder token으로 넣지 않고 identity residual로만 씁니다."
+            )
 
         if history_levels not in VALID_HISTORY_LEVELS:
             raise ValueError(
@@ -148,6 +177,10 @@ class DirectScorer(nn.Module):
         self.backbone = backbone
         self.scorer_type = scorer_type
         self.history_levels = history_levels
+        self.history_mode = history_mode
+        self.level_weights = tuple(float(w) for w in level_weights)
+        self.use_c4_identity = bool(use_c4_identity)
+        self.beta4 = float(beta4)
         self.d_model = backbone.d_model
 
         d = self.d_model
@@ -176,6 +209,17 @@ class DirectScorer(nn.Module):
                 nn.Linear(mlp_hidden, 1),
             )
 
+        # c4 identity residual용 projection.
+        # 앞 module들이 c123 실험과 같은 초기값을 갖도록 맨 뒤에 만든다.
+        self.c4_proj = nn.Linear(d, d) if self.use_c4_identity else None
+
+        # 학습하지 않는 상수. buffer로 둬서 state_dict에는 남긴다.
+        self.register_buffer(
+            "level_weight_vector",
+            torch.tensor(self.level_weights, dtype=torch.float32),
+            persistent=True,
+        )
+
         self.freeze_unused_backbone()
 
     # ------------------------------------------------------------ parameters
@@ -184,9 +228,10 @@ class DirectScorer(nn.Module):
         """이 설정에서 forward가 쓰지 않는 backbone parameter."""
         prefixes = UNUSED_BACKBONE_PREFIXES
 
-        if self.history_levels == 3:
+        if self.history_levels == 3 and not self.use_c4_identity:
             # history에서 c4를 빼면 c4_embedding이 어디에도 쓰이지 않는다.
             # candidate도 c1/c2/c3만 쓴다.
+            # 단 identity residual로 쓰면 다시 학습 대상이다.
             prefixes = prefixes + ("c4_embedding.",)
 
         return prefixes
@@ -292,11 +337,8 @@ class DirectScorer(nn.Module):
             article_embeddings,
         )
 
-    def encode_user(
-        self, history_sids: Tensor, history_mask: Tensor
-    ) -> Tuple[Tensor, Tensor]:
-        hidden, _, _ = self.run_encoder(history_sids, history_mask)
-
+    def split_levels(self, hidden: Tensor, history_mask: Tensor) -> Tensor:
+        """[B, H*L, d] -> [B, H, L, d]"""
         batch_size, seq_len, d_model = hidden.shape
 
         if seq_len % self.history_levels != 0:
@@ -313,13 +355,58 @@ class DirectScorer(nn.Module):
                 f"mask {history_mask.shape[1]}"
             )
 
-        # [B, H*L, d] -> [B, H, L, d] -> level 평균 -> [B, H, d]
-        article_vectors = hidden.view(
+        return hidden.view(
             batch_size, history_length, self.history_levels, d_model
-        ).mean(dim=2)
+        )
+
+    def semantic_vectors(self, level_hidden: Tensor) -> Tensor:
+        """level별 hidden을 article vector 하나로 합친다. -> [B, H, d]
+
+        mean     : 단순 평균
+        weighted : (1.0*h1 + 0.5*h2 + 0.1*h3) / 1.6
+        """
+        if self.history_mode == "mean":
+            return level_hidden.mean(dim=2)
+
+        weights = self.level_weight_vector.to(level_hidden.dtype)
+
+        return (
+            level_hidden * weights.view(1, 1, -1, 1)
+        ).sum(dim=2) / weights.sum()
+
+    def identity_residual(self, history_sids: Tensor) -> Optional[Tensor]:
+        """c4를 아주 약한 identity 신호로만 더한다. -> [B, H, d]
+
+        c4는 encoder token으로 들어가지 않는다. self-attention을 거치지
+        않고 article vector에 residual로만 붙는다.
+        """
+        if not self.use_c4_identity:
+            return None
+
+        return self.c4_proj(self.backbone.c4_embedding(history_sids[:, :, 3]))
+
+    def article_vectors(
+        self, history_sids: Tensor, history_mask: Tensor
+    ) -> Tuple[Tensor, Tensor]:
+        hidden, _, _ = self.run_encoder(history_sids, history_mask)
+
+        level_hidden = self.split_levels(hidden, history_mask)
+        semantic = self.semantic_vectors(level_hidden)
+
+        residual = self.identity_residual(history_sids)
+
+        if residual is None:
+            return semantic, level_hidden
+
+        return semantic + self.beta4 * residual, level_hidden
+
+    def encode_user(
+        self, history_sids: Tensor, history_mask: Tensor
+    ) -> Tuple[Tensor, Tensor]:
+        final, _ = self.article_vectors(history_sids, history_mask)
 
         return masked_attention_pool(
-            article_vectors, history_mask, self.pool_proj, self.pool_score
+            final, history_mask, self.pool_proj, self.pool_score
         )
 
     @torch.no_grad()
@@ -336,12 +423,7 @@ class DirectScorer(nn.Module):
         article_embeddings = self.embed_history(history_sids)
         hidden, encoder_inputs, _ = self.run_encoder(history_sids, history_mask)
 
-        batch_size, seq_len, d_model = hidden.shape
-        history_length = seq_len // levels
-
-        article_vectors = hidden.view(
-            batch_size, history_length, levels, d_model
-        ).mean(dim=2)
+        article_vectors, _ = self.article_vectors(history_sids, history_mask)
 
         user_vector, _ = masked_attention_pool(
             article_vectors, history_mask, self.pool_proj, self.pool_score
@@ -430,6 +512,69 @@ class DirectScorer(nn.Module):
 
     # ------------------------------------------------------------ 보고용
 
+    @torch.no_grad()
+    def describe_norms(
+        self, history_sids: Tensor, history_mask: Tensor
+    ) -> List[Tuple[str, float]]:
+        """한 batch에서 각 항의 크기를 잰다.
+
+        가중치를 곱한 뒤의 크기를 봐야 실제 기여를 알 수 있다.
+        padding 위치는 빼고 평균한다.
+        """
+        was_training = self.training
+        self.eval()
+
+        mask = history_mask.to(torch.bool)
+        count = mask.sum().clamp(min=1)
+
+        def mean_norm(tensor: Tensor) -> float:
+            norms = tensor.norm(dim=-1)
+            return float((norms * mask).sum().item() / count.item())
+
+        hidden, _, _ = self.run_encoder(history_sids, history_mask)
+        level_hidden = self.split_levels(hidden, history_mask)
+
+        weights = (
+            self.level_weight_vector.to(level_hidden.dtype)
+            if self.history_mode == "weighted"
+            else torch.ones(
+                self.history_levels, dtype=level_hidden.dtype,
+                device=level_hidden.device,
+            )
+        )
+
+        rows: List[Tuple[str, float]] = []
+
+        names = ["h1", "h2", "h3", "h4"][:self.history_levels]
+
+        for index, name in enumerate(names):
+            weight = float(weights[index])
+            label = name if weight == 1.0 else f"{weight:g}*{name}"
+            rows.append((
+                f"mean ||{label}||",
+                mean_norm(level_hidden[:, :, index] * weight),
+            ))
+
+        semantic = self.semantic_vectors(level_hidden)
+        rows.append(("mean ||a_semantic||", mean_norm(semantic)))
+
+        residual = self.identity_residual(history_sids)
+
+        if residual is None:
+            final = semantic
+        else:
+            rows.append(("mean ||P(e_c4)||", mean_norm(residual)))
+            rows.append((
+                f"mean ||{self.beta4:g}*P(e_c4)||",
+                mean_norm(self.beta4 * residual),
+            ))
+            final = semantic + self.beta4 * residual
+
+        rows.append(("mean ||a_final||", mean_norm(final)))
+
+        self.train(was_training)
+        return rows
+
     def parameter_report(self) -> Dict[str, object]:
         def total(pairs) -> int:
             return sum(param.numel() for _, param in pairs)
@@ -455,6 +600,10 @@ class DirectScorer(nn.Module):
                 "names": [name for name, _ in unused],
             },
             "history_levels": self.history_levels,
+            "history_mode": self.history_mode,
+            "level_weights": list(self.level_weights),
+            "use_c4_identity": self.use_c4_identity,
+            "beta4": self.beta4,
             "trainable_total": total(backbone_trainable) + total(new),
             "model_total": sum(p.numel() for p in self.parameters()),
         }

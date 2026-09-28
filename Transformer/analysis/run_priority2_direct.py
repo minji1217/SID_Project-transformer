@@ -92,11 +92,18 @@ BASELINES: List[Dict[str, Any]] = [
         "note": "alpha를 Train에서 학습",
     },
     {
-        "config": "P2-A c1234 history",
-        "detail": "direct u^T W v, history = c1c2c3c4",
+        "config": "P2-A c1234 mean",
+        "detail": "direct u^T W v, history = c1c2c3c4, 단순 평균",
         "tuned_on": "Train",
         "top1_accuracy": 0.26137,
-        "note": "c4 ablation의 직접 비교 대상",
+        "note": "c4를 encoder token으로 넣은 경우",
+    },
+    {
+        "config": "P2-A c123 mean",
+        "detail": "direct u^T W v, history = c1c2c3, 단순 평균",
+        "tuned_on": "Train",
+        "top1_accuracy": 0.26650,
+        "note": "이번 실험의 직접 비교 대상",
     },
     {
         "config": "Fixed weighted grid",
@@ -476,6 +483,52 @@ def print_shapes(
     return rows, all_ok
 
 
+def print_norms(
+    model: DirectScorer,
+    loader: DataLoader,
+    device: torch.device,
+) -> List[Dict[str, Any]]:
+    """첫 batch에서 각 항의 크기를 잰다.
+
+    가중치를 곱한 뒤의 크기를 봐야 실제 기여를 알 수 있다.
+    0.1*h3가 h1보다 한참 작으면 c3는 사실상 안 쓰이는 것이고,
+    0.01*P(e_c4)가 a_semantic에 비해 무시할 수준이면 identity
+    신호가 실제로 약한 것이다.
+    """
+    section("항별 크기 (첫 batch, padding 제외)")
+
+    batch = next(iter(loader))
+
+    history_sids = batch["history_sids"].to(device)
+    history_mask = batch["history_mask"].to(device)
+
+    rows = model.describe_norms(history_sids, history_mask)
+
+    largest = max(value for _, value in rows) or 1.0
+
+    print(f"  {'항':<26} {'평균 norm':>12}   {'상대':>7}")
+    print("  " + "-" * 52)
+
+    for label, value in rows:
+        print(f"  {label:<26} {value:>12.4f}   {value / largest:>6.1%}")
+
+    result = [{"term": label, "mean_norm": value} for label, value in rows]
+
+    semantic = next(
+        (v for k, v in rows if k == "mean ||a_semantic||"), None
+    )
+    residual = next(
+        (v for k, v in rows if k.startswith("mean ||") and "P(e_c4)" in k
+         and not k.startswith("mean ||P(")), None
+    )
+
+    if semantic and residual:
+        print()
+        print(f"  identity residual이 a_semantic의 {residual / semantic:.2%} 크기입니다.")
+
+    return result
+
+
 def build_optimizer(model: DirectScorer, learning_rate: float) -> AdamW:
     """학습 대상만 담는다. 쓰지 않는 decoder 계열은 넣지 않는다."""
     params = [
@@ -635,16 +688,34 @@ def offline_metrics(df: pd.DataFrame) -> Dict[str, float]:
 
 
 def comparison_rows(
-    result: Dict[str, float], scorer_type: str, history_levels: int
+    result: Dict[str, float],
+    scorer_type: str,
+    history_levels: int,
+    args: argparse.Namespace,
 ) -> List[Dict[str, Any]]:
     rows = [dict(row) for row in BASELINES]
 
+    codes = "c1234" if history_levels == 4 else "c123"
+
+    if args.history_mode == "weighted":
+        w = args.level_weights
+        label = f"P2 weighted {codes}"
+        detail = (
+            f"({w[0]:g}*h1 + {w[1]:g}*h2 + {w[2]:g}*h3) / {sum(w):g}"
+        )
+    else:
+        label = f"P2-A {codes} mean"
+        detail = f"direct u^T W v, history = {codes}, 단순 평균"
+
+    if args.use_c4_identity:
+        label += f" + {args.beta4:g}*c4"
+        detail += f", c4 identity residual beta4={args.beta4:g}"
+
+    label += f" ({scorer_type})"
+
     rows.append({
-        "config": f"P2-A c{'1234' if history_levels == 4 else '123'} history ({scorer_type})",
-        "detail": (
-            f"direct u^T W v, history = "
-            f"{'c1c2c3c4' if history_levels == 4 else 'c1c2c3'}"
-        ),
+        "config": label,
+        "detail": detail,
         "tuned_on": "Train",
         "top1_accuracy": result["top1_accuracy"],
         "mrr": result["mrr"],
@@ -731,6 +802,24 @@ def write_readme(
         f"candidate = `{metadata['candidate_codes']}`")
     add("")
 
+    if metadata["history_mode"] == "weighted":
+        w = metadata["level_weights"]
+        add(f"**article vector는 단순 평균이 아니다.** "
+            f"`({w[0]:g}*h1 + {w[1]:g}*h2 + {w[2]:g}*h3) / {sum(w):g}`")
+        add("")
+        add(f"`{w}`는 V1의 L1/L2/L3 score weight grid에서 Validation 기준")
+        add("가장 좋았던 비율이다. embedding 가중치로 최적이라고 증명된 값이")
+        add("아니라, 그 비율을 고정 가설로 옮겨와 확인하는 것이다.")
+        add("")
+
+    if metadata["use_c4_identity"]:
+        add(f"**c4는 encoder token으로 넣지 않는다.** self-attention을 거치지 "
+            f"않고")
+        add(f"`a_final = a_semantic + {metadata['beta4']:g} * P(e_c4)` 로 "
+            f"약한 identity residual로만 더한다.")
+        add(f"beta4 = {metadata['beta4']:g}는 고정이며 학습하지 않는다.")
+        add("")
+
     if metadata["history_levels"] == 3:
         add("**c4 ablation.** history 입력 자체를 `[B,H,3]`으로 만들어 c4를")
         add("encoder에 넣지 않았다. encoder에 넣고 평균에서만 빼면 "
@@ -797,6 +886,18 @@ def write_readme(
         add(f"| {row['stage']} | {tuple(row['actual'])} | "
             f"{tuple(row['expected'])} | {verdict} |")
 
+    add("")
+
+    add("## 항별 크기 (첫 batch)")
+    add("")
+    add("| 항 | 평균 norm |")
+    add("|---|---|")
+
+    for row in metadata["first_batch_norms"]:
+        add(f"| `{row['term']}` | {row['mean_norm']:.4f} |")
+
+    add("")
+    add("가중치를 곱한 뒤의 크기다. padding 위치는 제외했다.")
     add("")
 
     add("## parameter")
@@ -904,6 +1005,22 @@ def main() -> int:
         "--history-levels", type=int, default=4, choices=[3, 4],
         help="4 = history c1c2c3c4 (기본), 3 = history c1c2c3 (c4 ablation)",
     )
+    parser.add_argument(
+        "--history-mode", default="mean", choices=["mean", "weighted"],
+        help=(
+            "mean = (h1+h2+h3)/L, "
+            "weighted = (1.0*h1 + 0.5*h2 + 0.1*h3) / 1.6"
+        ),
+    )
+    parser.add_argument(
+        "--level-weights", type=float, nargs=3, default=[1.0, 0.5, 0.1],
+        metavar=("W1", "W2", "W3"),
+    )
+    parser.add_argument(
+        "--use-c4-identity", action="store_true",
+        help="c4를 encoder에 넣지 않고 약한 identity residual로만 더한다.",
+    )
+    parser.add_argument("--beta4", type=float, default=0.01)
     parser.add_argument("--scorer", default="bilinear", choices=["bilinear", "mlp"])
     parser.add_argument("--mlp-hidden", type=int, default=256)
     parser.add_argument("--mlp-dropout", type=float, default=0.0)
@@ -962,8 +1079,20 @@ def main() -> int:
     print(f"  train       : {train_path}")
     print(f"  validation  : {validation_path}")
     print(f"  scorer      : {args.scorer}")
-    print(f"  history     : {'c1c2c3c4' if args.history_levels == 4 else 'c1c2c3  (c4 ablation)'}"
-          f"  ({args.history_levels} level)")
+    print(f"  history     : {'c1c2c3c4' if args.history_levels == 4 else 'c1c2c3'}"
+          f"  ({args.history_levels} level, encoder token)")
+
+    if args.history_mode == "weighted":
+        w = args.level_weights
+        print(f"  article     : ({w[0]:g}*h1 + {w[1]:g}*h2 + {w[2]:g}*h3) "
+              f"/ {sum(w):g}   <- 단순 평균 아님")
+    else:
+        print(f"  article     : level 단순 평균")
+
+    if args.use_c4_identity:
+        print(f"  c4          : identity residual, beta4 = {args.beta4:g} (고정)")
+    else:
+        print(f"  c4          : 사용 안 함")
     print(f"  출력        : {out_dir}")
     print(f"  device      : {device}")
     print(f"  gin binding : {len(bindings)}개  (출처: {binding_source})")
@@ -1032,6 +1161,10 @@ def main() -> int:
         mlp_hidden=args.mlp_hidden,
         mlp_dropout=args.mlp_dropout,
         history_levels=args.history_levels,
+        history_mode=args.history_mode,
+        level_weights=tuple(args.level_weights),
+        use_c4_identity=args.use_c4_identity,
+        beta4=args.beta4,
     ).to(device)
 
     init_check = verify_initialization(model, before, args.seed, device)
@@ -1047,6 +1180,8 @@ def main() -> int:
 
     if not shapes_ok:
         return 1
+
+    norm_rows = print_norms(model, train_loader, device)
 
     optimizer = build_optimizer(model, args.learning_rate)
     loss_fn = TransformerLoss().to(device)
@@ -1182,7 +1317,7 @@ def main() -> int:
 
     # ---- 비교
     comparison = comparison_rows(
-        best["metrics"], args.scorer, args.history_levels
+        best["metrics"], args.scorer, args.history_levels, args
     )
     print_comparison(comparison)
 
@@ -1216,6 +1351,11 @@ def main() -> int:
         "history_codes": (
             "c1,c2,c3,c4" if args.history_levels == 4 else "c1,c2,c3"
         ),
+        "history_mode": args.history_mode,
+        "level_weights": list(args.level_weights),
+        "use_c4_identity": args.use_c4_identity,
+        "beta4": args.beta4,
+        "beta4_learnable": False,
         "candidate_codes": "c1,c2,c3",
         "score_formula": (
             "D = u^T W v" if args.scorer == "bilinear"
@@ -1232,6 +1372,7 @@ def main() -> int:
         "config_check": config_check,
         "initialization_check": init_check,
         "shape_check": shape_rows,
+        "first_batch_norms": norm_rows,
         "parameter_report": param_report,
         "optimizer": "AdamW",
         "learning_rate": args.learning_rate,
