@@ -110,6 +110,46 @@ def git_commit_hash() -> Optional[str]:
         return None
 
 
+# checkpoint의 run_summary.json에서 설정을 가져올 때 빼는 항목.
+# 모델 구조와 무관하고 추론에 영향을 주지 않는다.
+BINDING_PREFIXES_TO_DROP = (
+    "train.save_dir",
+    "train.num_workers",
+    "train.prefetch_factor",
+    "train.progress_interval",
+    "train.num_epochs",
+    "train.early_stopping_patience",
+    "train.seed",
+    "train.save_every_epoch",
+    "train.save_optimizer_state",
+    "train.train_path",
+    "train.validation_path",
+)
+
+
+def bindings_from_run_summary(checkpoint: Path) -> Optional[List[str]]:
+    """checkpoint를 만든 학습의 gin override를 그대로 가져온다.
+
+    selected_final.json이 없을 때 쓴다.
+    학습 때 쓴 문자열을 그대로 재사용하므로 값 표기가 달라질 여지가 없다.
+    """
+    summary_path = checkpoint.parent / "run_summary.json"
+
+    if not summary_path.exists():
+        return None
+
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    overrides = summary.get("gin_overrides") or []
+
+    # override가 하나도 없는 경우도 정상이다.
+    # base gin 파일만으로 설정이 끝났다는 뜻이고,
+    # predict_sid.py도 같은 파일을 읽으므로 추가할 것이 없다.
+    return [
+        binding for binding in overrides
+        if not binding.split("=", 1)[0].strip().startswith(BINDING_PREFIXES_TO_DROP)
+    ]
+
+
 def load_reference(
     checkpoint: Path,
     explicit: Optional[str],
@@ -170,6 +210,7 @@ def run_predict(
     bindings: Dict[str, Any],
     batch_size: int,
     num_workers: int,
+    binding_strings: Optional[List[str]] = None,
 ) -> int:
     command = [
         sys.executable, "-u", str(PREDICT_SCRIPT),
@@ -181,8 +222,12 @@ def run_predict(
         "--num_workers", str(num_workers),
     ]
 
-    for key in sorted(bindings):
-        command += ["--gin-binding", format_binding(key, bindings[key])]
+    if binding_strings:
+        for binding in binding_strings:
+            command += ["--gin-binding", binding]
+    else:
+        for key in sorted(bindings):
+            command += ["--gin-binding", format_binding(key, bindings[key])]
 
     with log_path.open("w", encoding="utf-8") as log_file:
         process = subprocess.run(
@@ -604,21 +649,43 @@ def main() -> int:
 
     final_path = sweep_dir / "seed_robustness" / "selected_final.json"
 
-    if not final_path.exists():
-        print(f"{final_path}가 없습니다.")
-        return 1
-
     if not validation_path.exists():
         print(f"validation 파일이 없습니다: {validation_path}")
         return 1
 
-    final = json.loads(final_path.read_text(encoding="utf-8"))
-    params: Dict[str, Any] = final.get("config") or {}
+    params: Dict[str, Any] = {}
+    binding_strings: Optional[List[str]] = None
+    config_source = str(final_path)
 
-    if args.checkpoint:
+    if final_path.exists():
+        final = json.loads(final_path.read_text(encoding="utf-8"))
+        params = final.get("config") or {}
+
+        checkpoint = (
+            resolve_path(args.checkpoint) if args.checkpoint
+            else find_checkpoint(final, args.seed)
+        )
+    elif args.checkpoint:
+        # selected_final.json이 없으면 checkpoint를 만든 학습의
+        # gin override를 그대로 쓴다.
         checkpoint = resolve_path(args.checkpoint)
+        binding_strings = bindings_from_run_summary(checkpoint)
+
+        if binding_strings is None:
+            print(f"{final_path}도 없고 "
+                  f"{checkpoint.parent / 'run_summary.json'}도 없습니다.")
+            print("--sweep-out을 selected_final.json이 있는 폴더로 지정하세요.")
+            return 1
+
+        if not binding_strings:
+            print("  (학습 때 gin override가 없었습니다. base config만 씁니다.)")
+
+        config_source = str(checkpoint.parent / "run_summary.json")
     else:
-        checkpoint = find_checkpoint(final, args.seed)
+        print(f"{final_path}가 없습니다.")
+        print("--checkpoint로 checkpoint를 직접 지정하거나")
+        print("--sweep-out을 selected_final.json이 있는 폴더로 지정하세요.")
+        return 1
 
     reference, reference_source = load_reference(checkpoint, args.reference_summary)
 
@@ -635,7 +702,7 @@ def main() -> int:
     print("=" * 74)
     print("V2 Priority 0 — score decomposition")
     print("=" * 74)
-    print(f"config      : {final.get('config_description')}")
+    print(f"설정 출처   : {config_source}")
     print(f"checkpoint  : {checkpoint}")
     print(f"validation  : {validation_path}")
     print(f"seed        : {args.seed}")
@@ -666,6 +733,7 @@ def main() -> int:
             bindings=params,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
+            binding_strings=binding_strings,
         )
 
         if code != 0:
@@ -821,8 +889,9 @@ def main() -> int:
         "dataset": str(validation_path),
         "scores_parquet": str(scores_path),
         "seed": args.seed,
-        "config": params,
-        "config_description": final.get("config_description"),
+        "config": params or None,
+        "config_source": config_source,
+        "gin_bindings": binding_strings,
         "num_impressions": s123["num_impressions"],
         "batch_size": args.batch_size,
         "num_workers": args.num_workers,
