@@ -71,12 +71,20 @@ SCORE_TYPES = (
 
 LEVEL_COLUMNS = {"L1": "c1_log_prob", "L2": "c2_log_prob", "L3": "c3_log_prob"}
 
-# 기존에 보고된 seed 42 validation 성능. 재현 확인에만 쓴다.
+# V1(shuffle 전) seed 42 validation 성능. 기준을 못 찾을 때만 쓴다.
 REFERENCE_SEED42 = {
     "top1_accuracy": 0.2702,
     "mrr": 0.5205,
     "ndcg@5": 0.6389,
     "auc": 0.5858,
+}
+
+# run_summary.json의 best_metrics 키 -> 이 스크립트의 metric 이름
+SUMMARY_METRIC_KEYS = {
+    "val_top1_accuracy": "top1_accuracy",
+    "val_mrr": "mrr",
+    "val_ndcg@5": "ndcg@5",
+    "val_auc": "auc",
 }
 
 # 재현 판정 허용 오차. float32 저장 반올림만 허용한다.
@@ -100,6 +108,42 @@ def git_commit_hash() -> Optional[str]:
         return out.stdout.strip() if out.returncode == 0 else None
     except Exception:
         return None
+
+
+def load_reference(
+    checkpoint: Path,
+    explicit: Optional[str],
+) -> tuple[Dict[str, float], str]:
+    """재현 확인에 쓸 기준값을 찾는다.
+
+    checkpoint를 만든 학습의 run_summary.json이 옆에 있으면 그걸 쓴다.
+    그래야 shuffle 전/후 어느 데이터로 돌렸든 자기 자신과 비교하게 된다.
+    없으면 V1 seed 42 값으로 되돌아간다.
+    """
+    candidates = []
+
+    if explicit:
+        candidates.append(Path(explicit).expanduser())
+
+    candidates.append(checkpoint.parent / "run_summary.json")
+
+    for path in candidates:
+        if not path.exists():
+            continue
+
+        summary = json.loads(path.read_text(encoding="utf-8"))
+        best = summary.get("best_metrics") or {}
+
+        values = {
+            name: best[key]
+            for key, name in SUMMARY_METRIC_KEYS.items()
+            if best.get(key) is not None
+        }
+
+        if len(values) == len(SUMMARY_METRIC_KEYS):
+            return values, str(path)
+
+    return dict(REFERENCE_SEED42), "V1 seed 42 (하드코딩)"
 
 
 def find_checkpoint(final: Dict[str, Any], seed: int) -> Path:
@@ -240,6 +284,23 @@ def evaluate_score_type(df: pd.DataFrame, name: str) -> Dict[str, Any]:
     scores = df[name].to_numpy()
     labels = df["label"].to_numpy().astype(int)
 
+    # tie 분석
+    # S1/S2/S3/S12는 항이 적어 exact tie가 자주 난다.
+    # evaluate_ranking의 Top-1은 np.argmax라 동점이면 낮은 index를 고른다.
+    # 그 값이 실제 변별력인지 동점 처리 결과인지 갈라야 한다.
+    grid = scores.reshape(-1, NUM_CANDIDATES)
+    label_grid = labels.reshape(-1, NUM_CANDIDATES)
+
+    best_value = grid.max(axis=1, keepdims=True)
+    is_best = grid == best_value
+    tie_count = is_best.sum(axis=1)
+
+    # 최고점이 k개이고 그 안에 positive가 있으면 1/k만 인정
+    positive_is_best = (is_best & (label_grid == 1)).any(axis=1)
+    tie_aware_top1 = float(np.mean(np.where(positive_is_best, 1.0 / tie_count, 0.0)))
+
+    tied = tie_count > 1
+
     positive = scores[labels == 1]
     negative = scores[labels == 0]
 
@@ -257,6 +318,13 @@ def evaluate_score_type(df: pd.DataFrame, name: str) -> Dict[str, Any]:
     return {
         "score_type": name,
         "top1_accuracy": metrics["top1_accuracy"],
+        "naive_argmax_top1": metrics["top1_accuracy"],
+        "tie_aware_top1": tie_aware_top1,
+        "tie_gap": metrics["top1_accuracy"] - tie_aware_top1,
+        "tied_impressions": int(tied.sum()),
+        "tied_rate": float(tied.mean()),
+        "mean_tie_count": float(tie_count.mean()),
+        "all_tied_impressions": int((tie_count == NUM_CANDIDATES).sum()),
         "mrr": metrics["mrr"],
         "ndcg5": metrics["ndcg@5"],
         "auc": metrics["auc"],
@@ -334,6 +402,8 @@ def write_report(
     transitions: List[Dict[str, Any]],
     sanity: Dict[str, Any],
     metadata: Dict[str, Any],
+    reference: Dict[str, float],
+    reference_source: str,
 ) -> None:
     by_name = {r["score_type"]: r for r in rows}
     s12, s123 = by_name["S12"], by_name["S123"]
@@ -370,9 +440,9 @@ def write_report(
     add("추론은 fp32다 (predict_sid.py는 AMP를 쓰지 않는다).")
     add("parquet의 float32 값을 float64로 다시 더하므로 1e-6 수준 차이는 정상이다.")
     add("")
-    add("기존 보고값과의 재현 확인")
+    add(f"학습 당시 결과와의 재현 확인 (기준: `{reference_source}`)")
     add("")
-    add("| metric | 기존 seed 42 | S123 | 차이 |")
+    add("| metric | 학습 당시 | S123 | 차이 |")
     add("|---|---|---|---|")
 
     for key, label in (
@@ -380,7 +450,7 @@ def write_report(
         ("ndcg5", "nDCG@5"), ("auc", "AUC"),
     ):
         ref_key = "ndcg@5" if key == "ndcg5" else key
-        ref = REFERENCE_SEED42[ref_key]
+        ref = reference[ref_key]
         got = s123[key]
         add(f"| {label} | {ref:.4f} | {got:.4f} | {got - ref:+.4f} |")
 
@@ -398,6 +468,24 @@ def write_report(
             f"{row['score_gap']:.4f} |"
         )
 
+    add("")
+    add("### 동점(tie) 분석")
+    add("")
+    add("| score | naive argmax Top-1 | tie-aware Top-1 | 차이 | tie impression | 비율 |")
+    add("|---|---|---|---|---|---|")
+
+    for row in rows:
+        add(
+            f"| {row['score_type']} | {row['naive_argmax_top1']:.4f} | "
+            f"{row['tie_aware_top1']:.4f} | {row['tie_gap']:+.4f} | "
+            f"{row['tied_impressions']:,} | {row['tied_rate']:.2%} |"
+        )
+
+    add("")
+    add("- **naive argmax**: 현재 `evaluate/metrics.py` 방식. 동점이면 낮은 index")
+    add("- **tie-aware**: 최고점이 k개이고 그중 positive가 있으면 1/k credit")
+    add("")
+    add("차이가 크면 그 score의 Top-1은 실제 변별력이 아니라 동점 처리 결과다.")
     add("")
     add("S1 / S12 / S123은 더하는 항의 개수가 달라 raw score의 scale이 다르다.")
     add("따라서 gap 크기만으로 우열을 판단하지 않는다.")
@@ -474,7 +562,28 @@ def main() -> int:
     parser.add_argument("--config", required=True)
     parser.add_argument("--sweep-out", required=True)
     parser.add_argument("--validation-path", required=True)
+    parser.add_argument(
+        "--out", default=None,
+        help=(
+            "결과 폴더. 생략하면 "
+            "<sweep-out>/priority0_score_decomposition/seed<N>"
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--checkpoint", default=None,
+        help=(
+            "쓸 checkpoint를 직접 지정한다. "
+            "생략하면 selected_final.json에서 해당 seed의 것을 찾는다."
+        ),
+    )
+    parser.add_argument(
+        "--reference-summary", default=None,
+        help=(
+            "재현 확인 기준으로 쓸 run_summary.json. "
+            "생략하면 checkpoint 옆의 run_summary.json을 쓴다."
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument(
@@ -505,13 +614,21 @@ def main() -> int:
 
     final = json.loads(final_path.read_text(encoding="utf-8"))
     params: Dict[str, Any] = final.get("config") or {}
-    checkpoint = find_checkpoint(final, args.seed)
+
+    if args.checkpoint:
+        checkpoint = resolve_path(args.checkpoint)
+    else:
+        checkpoint = find_checkpoint(final, args.seed)
+
+    reference, reference_source = load_reference(checkpoint, args.reference_summary)
 
     if not checkpoint.exists():
         print(f"checkpoint가 없습니다: {checkpoint}")
         return 1
 
-    output_dir = sweep_dir / "priority0_score_decomposition" / f"seed{args.seed}"
+    output_dir = resolve_path(args.out) if args.out else (
+        sweep_dir / "priority0_score_decomposition" / f"seed{args.seed}"
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print()
@@ -522,6 +639,7 @@ def main() -> int:
     print(f"checkpoint  : {checkpoint}")
     print(f"validation  : {validation_path}")
     print(f"seed        : {args.seed}")
+    print(f"기준값      : {reference_source}")
     print(f"출력        : {output_dir}")
     print("Test 데이터는 사용하지 않습니다. 재학습하지 않습니다.")
 
@@ -593,6 +711,29 @@ def main() -> int:
             f"{row['score_gap']:>9.4f}"
         )
 
+    # tie 분석
+    print()
+    print("=" * 74)
+    print("동점(tie) 분석")
+    print("=" * 74)
+    print(f"  {'score':<7}{'naive argmax':>15}{'tie-aware':>12}{'차이':>10}"
+          f"{'tie impression':>17}{'비율':>9}")
+    print("  " + "-" * 72)
+
+    for row in rows:
+        print(
+            f"  {row['score_type']:<7}{row['naive_argmax_top1']:>15.4f}"
+            f"{row['tie_aware_top1']:>12.4f}{row['tie_gap']:>+10.4f}"
+            f"{row['tied_impressions']:>17,}{row['tied_rate']:>9.2%}"
+        )
+
+    print()
+    print("  naive argmax : 현재 evaluate/metrics.py 방식. 동점이면 낮은 index")
+    print("  tie-aware    : 최고점이 k개이고 그중 positive가 있으면 1/k credit")
+    print()
+    print("  차이가 크면 그 score의 Top-1은 실제 변별력이 아니라")
+    print("  동점 처리 규칙이 만든 값이다.")
+
     print()
     print("  무작위 기준: Top-1 0.2000 | MRR 0.4567 | nDCG@5 0.5897 | AUC 0.5000")
     print()
@@ -604,8 +745,10 @@ def main() -> int:
 
     print()
     print("=" * 74)
-    print("기존 seed 42 validation 결과와 재현 확인")
+    print("학습 당시 validation 결과와 재현 확인")
     print("=" * 74)
+    print(f"  기준 : {reference_source}")
+    print()
 
     reproduced = True
 
@@ -614,13 +757,13 @@ def main() -> int:
         ("ndcg5", "nDCG@5"), ("auc", "AUC"),
     ):
         ref_key = "ndcg@5" if key == "ndcg5" else key
-        ref = REFERENCE_SEED42[ref_key]
+        ref = reference[ref_key]
         got = s123[key]
         gap = abs(got - ref)
         ok = gap <= REPRODUCTION_TOLERANCE
         reproduced = reproduced and ok
 
-        print(f"  {label:<8} 기존 {ref:.4f} | S123 {got:.4f} | 차이 {got - ref:+.4f}"
+        print(f"  {label:<8} 학습시 {ref:.4f} | S123 {got:.4f} | 차이 {got - ref:+.4f}"
               f"  {'OK' if ok else '<<< 불일치'}")
 
     if not reproduced:
@@ -684,8 +827,11 @@ def main() -> int:
         "batch_size": args.batch_size,
         "num_workers": args.num_workers,
         "reused_existing_scores": bool(args.scores_path),
-        "reproduced_reference": reproduced,
-        "reference_seed42": REFERENCE_SEED42,
+        "reference_comparison": {
+            "status": "match" if reproduced else "mismatch",
+            "source": reference_source,
+            "reference": reference,
+        },
         "started_at_utc": datetime.fromtimestamp(started_at, timezone.utc).isoformat(),
         "finished_at_utc": datetime.now(timezone.utc).isoformat(),
         "elapsed_seconds": round(time.time() - started_at, 2),
@@ -706,7 +852,10 @@ def main() -> int:
     )
 
     report_path = output_dir / "report.md"
-    write_report(report_path, rows, transitions, sanity, metadata)
+    write_report(
+        report_path, rows, transitions, sanity, metadata,
+        reference, reference_source,
+    )
 
     print()
     print("=" * 74)
