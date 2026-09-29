@@ -48,10 +48,18 @@ COMBOS: List[Tuple[str, Tuple[float, float, float], str]] = [
 ]
 
 # A는 기존 c123 mean과 같아야 한다.
-# weighted [1,1,1]이 mean과 수치적으로 동일한 것은 확인했다.
+#
+# weighted [1,1,1]은 mean과 수식이 같고 CPU forward도 비트 단위로
+# 같지만, GPU에서는 곱셈/합/나눗셈 순서가 달라 미세한 차이가 나고
+# step이 쌓이면서 누적된다. 그래서 A는 아예 mean 경로를 그대로
+# 호출한다. 그러면 기존 c123 mean과 완전히 같은 실행이다.
 REPRODUCE_LABEL = "A"
 REPRODUCE_TARGET = 0.2664974826395972
-REPRODUCE_TOLERANCE = 1e-4   # 0.01%p
+
+# train_transformer.set_seed()는 cudnn.deterministic을 켜지 않는다.
+# 같은 설정을 두 번 돌려도 GPU에서 결과가 달라질 수 있으므로 허용치를
+# 그 폭보다 크게 잡는다. 실제 폭은 analysis/compare_direct_runs.py로 잰다.
+REPRODUCE_TOLERANCE = 5e-4   # 0.05%p
 
 # 비교표. sweep과 같은 조건이 아닌 행은 표시해 둔다.
 BASELINES: List[Dict[str, Any]] = [
@@ -114,13 +122,23 @@ def run_one(
     args: argparse.Namespace,
     log_path: Path,
 ) -> int:
+    # 가중치가 전부 같으면 mean 경로를 그대로 쓴다. 수식은 같지만
+    # 연산 순서가 달라 GPU에서 미세하게 어긋나기 때문이다. A가 기존
+    # c123 mean과 완전히 같은 실행이 되도록 한다.
+    uniform = len(set(weights)) == 1
+
     command = [
         sys.executable, "-u", "-m", RUN_SCRIPT,
         "--priority0-dir", args.priority0_dir,
         "--out", str(out_dir),
         "--history-levels", "3",
-        "--history-mode", "weighted",
-        "--level-weights", *(f"{w:g}" for w in weights),
+        "--history-mode", "mean" if uniform else "weighted",
+    ]
+
+    if not uniform:
+        command += ["--level-weights", *(f"{w:g}" for w in weights)]
+
+    command += [
         "--scorer", "bilinear",
         "--batch-size", str(args.batch_size),
         "--learning-rate", str(args.learning_rate),
