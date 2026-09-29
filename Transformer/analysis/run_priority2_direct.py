@@ -72,8 +72,10 @@ EXPECTED_CONFIG: Dict[str, Any] = {
     "NewsEncoderDecoderTransformer.num_heads": 8,
     "NewsEncoderDecoderTransformer.num_layers": 2,
     "NewsEncoderDecoderTransformer.d_ff": 1024,
-    "NewsEncoderDecoderTransformer.dropout_rate": 0.0,
+    # dropout_rate는 --dropout으로 정한다. 기본 0.0이 V1 final config다.
 }
+
+DROPOUT_KEY = "NewsEncoderDecoderTransformer.dropout_rate"
 
 # 비교표. 29.312%는 validation에서 고른 참고값이지 합격선이 아니다.
 BASELINES: List[Dict[str, Any]] = [
@@ -188,7 +190,7 @@ def configure_gin(config_path: Path, bindings: List[str]) -> None:
         gin.parse_config(bindings, skip_unknown=True)
 
 
-def verify_config() -> Dict[str, Any]:
+def verify_config(expected_dropout: float = 0.0) -> Dict[str, Any]:
     """유효 gin 값이 V1 final config와 같은지 본다.
 
     다르면 warning이 아니라 실행 중단이다. 설정이 어긋난 채로 학습하면
@@ -199,10 +201,13 @@ def verify_config() -> Dict[str, Any]:
     rows: List[Dict[str, Any]] = []
     mismatched: List[str] = []
 
+    expected_config = dict(EXPECTED_CONFIG)
+    expected_config[DROPOUT_KEY] = float(expected_dropout)
+
     print(f"  {'parameter':<52} {'기대값':>10} {'실제값':>10}")
     print("  " + "-" * 76)
 
-    for key, expected in EXPECTED_CONFIG.items():
+    for key, expected in expected_config.items():
         try:
             actual: Any = gin.query_parameter(key)
         except (ValueError, KeyError, TypeError):
@@ -529,14 +534,16 @@ def print_norms(
     return result
 
 
-def build_optimizer(model: DirectScorer, learning_rate: float) -> AdamW:
+def build_optimizer(
+    model: DirectScorer, learning_rate: float, weight_decay: float = 0.0
+) -> AdamW:
     """학습 대상만 담는다. 쓰지 않는 decoder 계열은 넣지 않는다."""
     params = [
         param for _, param in
         model.backbone_trainable_parameters() + model.new_parameters()
     ]
 
-    return AdamW(params, lr=learning_rate, weight_decay=0.0)
+    return AdamW(params, lr=learning_rate, weight_decay=weight_decay)
 
 
 # ---------------------------------------------------------------- 학습 / 평가
@@ -835,7 +842,8 @@ def write_readme(
     add(f"- scorer        : {metadata['scorer_type']}")
     add(f"- batch size    : {args.batch_size}")
     add(f"- learning rate : {args.learning_rate}  (단일, freeze 구간 없음)")
-    add(f"- weight decay  : 0")
+    add(f"- dropout       : {args.dropout}")
+    add(f"- weight decay  : {args.weight_decay}")
     add(f"- max epoch     : {args.max_epochs}, patience {args.patience}")
     add(f"- best 선택     : Validation Top-1")
     add(f"- seed          : {args.seed}")
@@ -1027,6 +1035,11 @@ def main() -> int:
 
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--learning-rate", type=float, default=5e-5)
+    parser.add_argument(
+        "--dropout", type=float, default=0.0,
+        help="NewsEncoderDecoderTransformer.dropout_rate를 이 값으로 둔다.",
+    )
+    parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--max-epochs", type=int, default=30)
     parser.add_argument("--patience", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
@@ -1065,6 +1078,13 @@ def main() -> int:
 
     bindings, binding_source = bindings_from_priority0(p0_meta, args.gin_binding)
 
+    # dropout은 gin으로 들어가므로 Priority 0 설정 뒤에 덮어쓴다.
+    bindings = [
+        b for b in bindings
+        if b.split("=", 1)[0].strip() != DROPOUT_KEY
+    ]
+    bindings.append(format_binding(DROPOUT_KEY, float(args.dropout)))
+
     for path, label in (
         (train_path, "train parquet"),
         (validation_path, "validation parquet"),
@@ -1102,6 +1122,8 @@ def main() -> int:
 
     print(f"  seed        : {args.seed}")
     print(f"  learning rate: {args.learning_rate}")
+    print(f"  dropout     : {args.dropout}")
+    print(f"  weight decay: {args.weight_decay}")
     print()
     print("  V1 checkpoint를 쓰지 않습니다. random init에서 from-scratch로")
     print("  학습합니다. 생성확률(L1/L2/L3)을 score로 쓰지 않습니다.")
@@ -1109,7 +1131,7 @@ def main() -> int:
 
     configure_gin(config_path, bindings)
 
-    config_check = verify_config()
+    config_check = verify_config(expected_dropout=args.dropout)
 
     if not config_check["all_match"]:
         return 1
@@ -1183,7 +1205,9 @@ def main() -> int:
 
     norm_rows = print_norms(model, train_loader, device)
 
-    optimizer = build_optimizer(model, args.learning_rate)
+    optimizer = build_optimizer(
+        model, args.learning_rate, args.weight_decay
+    )
     loss_fn = TransformerLoss().to(device)
 
     # ---- 학습
@@ -1376,7 +1400,8 @@ def main() -> int:
         "parameter_report": param_report,
         "optimizer": "AdamW",
         "learning_rate": args.learning_rate,
-        "weight_decay": 0.0,
+        "dropout": args.dropout,
+        "weight_decay": args.weight_decay,
         "batch_size": args.batch_size,
         "max_epochs": args.max_epochs,
         "patience": args.patience,
