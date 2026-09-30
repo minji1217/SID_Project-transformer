@@ -660,15 +660,31 @@ def predict_validation(
         )
 
         impression_ids = batch["impression_ids"]
+        article_ids = batch.get("candidate_article_ids")
 
         for i in range(batch_size):
+            # 후보 기사 ID. 나중에 다른 score와 정렬을 맞출 때 쓴다.
+            row_article_ids = (
+                article_ids[i] if article_ids is not None else None
+            )
+
             for candidate_idx in range(num_candidates):
                 sid = candidate_sids[i, candidate_idx].detach().cpu().tolist()
+
+                article_id = (
+                    row_article_ids[candidate_idx]
+                    if row_article_ids is not None
+                    and candidate_idx < len(row_article_ids)
+                    else None
+                )
 
                 rows.append({
                     "impression_id": impression_ids[i],
                     GROUP_COLUMN: sample_index,
                     "candidate_index": candidate_idx,
+                    "candidate_article_id": (
+                        str(article_id) if article_id is not None else None
+                    ),
                     "label": float(candidate_labels[i, candidate_idx].item()),
                     "c1": int(sid[0]),
                     "c2": int(sid[1]),
