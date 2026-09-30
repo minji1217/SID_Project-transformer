@@ -43,6 +43,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 from evaluate.metrics import evaluate_ranking
 from sweep.run_stage import write_csv
@@ -60,14 +61,14 @@ LAMBDAS = [round(0.1 * i, 1) for i in range(11)]
 
 EPS = 1e-8
 
-# 두 끝점이 재현해야 하는 값. GPU 비결정성과 무관하게 같은 파일을
-# 읽어 계산하므로 아주 작은 오차만 허용한다.
-REPRODUCE_TOLERANCE = 1e-6
+# 끝점 검증은 입력 파일에서 직접 다시 계산한 raw metric으로 한다.
+# 아래 값들은 표에 같이 보여주는 참고값일 뿐, 합격 기준이 아니다.
+REPRODUCE_TOLERANCE = 1e-9
 
 RANDOM_TOP1 = 0.20
-V1_EQUAL_TOP1 = 0.27059
-G_REFERENCE_TOP1 = 0.29312
-D_REFERENCE_TOP1 = 0.26689
+V1_EQUAL_REFERENCE = 0.27059
+G_PAST_REFERENCE = 0.29312
+D_PAST_REFERENCE = 0.26689
 
 CAVEAT_EN = (
     "This hybrid sweep is Validation-tuned and is used only to diagnose\n"
@@ -106,6 +107,154 @@ def git_commit_hash() -> Optional[str]:
 def resolve_path(path: str) -> Path:
     path_obj = Path(path).expanduser()
     return path_obj if path_obj.is_absolute() else BASE_DIR / path_obj
+
+
+SOURCE_COLUMNS = [
+    "impression_id",
+    "candidate_article_ids",
+    "candidate_c1", "candidate_c2", "candidate_c3",
+    "candidate_labels",
+]
+
+
+def load_candidate_source(validation_path: Path) -> pd.DataFrame:
+    """원본 validation parquet을 후보 단위로 편다.
+
+    impression 하나가 한 행이고 candidate_* 가 길이 5 배열이므로,
+    후보 위치를 보존한 채 펴서 (impression_id, candidate position)으로
+    찾을 수 있게 만든다. 예측 파일이 아니라 모델에 들어간 원본이다.
+    """
+    available = set(
+        pq.ParquetFile(validation_path).schema_arrow.names
+    )
+    missing = [c for c in SOURCE_COLUMNS if c not in available]
+
+    if missing:
+        raise ValueError(
+            f"원본 validation parquet에 필요한 컬럼이 없습니다: "
+            f"{', '.join(missing)}\n"
+            f"  파일 : {validation_path}\n"
+            "  이 진단은 기사 ID를 원본에서만 가져옵니다. "
+            "(c1,c2,c3)를 대체키로 쓰지 않습니다."
+        )
+
+    frame = pd.read_parquet(validation_path, columns=SOURCE_COLUMNS)
+
+    duplicated = int(frame["impression_id"].duplicated().sum())
+
+    if duplicated:
+        raise ValueError(
+            f"원본에 impression_id가 중복됩니다 ({duplicated:,}개). "
+            "impression_id로 대응시킬 수 없습니다."
+        )
+
+    def stack(column: str) -> np.ndarray:
+        values = [np.asarray(v) for v in frame[column]]
+        lengths = {len(v) for v in values}
+
+        if lengths != {NUM_CANDIDATES}:
+            raise ValueError(
+                f"{column}의 길이가 {NUM_CANDIDATES}가 아닌 행이 있습니다: "
+                f"{sorted(lengths)}"
+            )
+
+        return np.stack(values)
+
+    article_ids = stack("candidate_article_ids")
+    c1 = stack("candidate_c1")
+    c2 = stack("candidate_c2")
+    c3 = stack("candidate_c3")
+    labels = stack("candidate_labels")
+
+    num_rows = len(frame)
+
+    return pd.DataFrame({
+        "impression_id": np.repeat(
+            frame["impression_id"].to_numpy(), NUM_CANDIDATES
+        ),
+        "candidate_index": np.tile(
+            np.arange(NUM_CANDIDATES), num_rows
+        ),
+        "source_article_id": article_ids.reshape(-1),
+        "source_c1": c1.reshape(-1).astype(np.int64),
+        "source_c2": c2.reshape(-1).astype(np.int64),
+        "source_c3": c3.reshape(-1).astype(np.int64),
+        "source_label": labels.reshape(-1).astype(np.int64),
+    })
+
+
+def attach_source(
+    frame: pd.DataFrame, source: pd.DataFrame, name: str
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """예측에 원본 기사 ID를 붙이고, 원본과 맞는지 확인한다.
+
+    (impression_id, candidate position)으로 붙인다. 붙인 뒤 예측이
+    들고 있던 c1/c2/c3/label이 원본과 같은지 본다. 여기가 맞으면
+    그 예측이 원본의 어느 후보를 매겼는지 확정된다.
+    """
+    section(f"원본 대조 — {name}")
+
+    before = len(frame)
+
+    merged = frame.merge(
+        source, on=["impression_id", "candidate_index"],
+        how="left", validate="1:1",
+    )
+
+    if len(merged) != before:
+        raise ValueError(
+            f"{name}에 원본을 붙이면서 row 수가 바뀌었습니다: "
+            f"{before:,} -> {len(merged):,}"
+        )
+
+    unmatched = int(merged["source_article_id"].isna().sum())
+
+    print(f"  row {before:,}개")
+    print(f"  원본에서 찾지 못한 후보: {unmatched:,}")
+
+    if unmatched:
+        raise ValueError(
+            f"{name}의 후보 {unmatched:,}개가 원본에 없습니다. "
+            "impression_id 또는 후보 위치가 맞지 않습니다."
+        )
+
+    checks: List[Dict[str, Any]] = []
+
+    def check(label: str, left: pd.Series, right: pd.Series) -> None:
+        a = left.astype(np.int64).to_numpy()
+        b = right.astype(np.int64).to_numpy()
+        mismatched = int((a != b).sum())
+
+        checks.append({
+            "field": label, "mismatched": mismatched,
+            "passed": mismatched == 0,
+        })
+
+        print(f"  {'OK  ' if mismatched == 0 else 'FAIL'}  "
+              f"{label:<28} 불일치 {mismatched:,} / {len(a):,}")
+
+        if mismatched:
+            raise ValueError(
+                f"{name}의 {label}이 원본과 다릅니다 ({mismatched:,}개). "
+                "예측이 원본과 다른 후보를 가리킵니다."
+            )
+
+    check("label", merged["label"], merged["source_label"])
+
+    for level in ("c1", "c2", "c3"):
+        if level in merged.columns:
+            check(f"candidate {level}", merged[level],
+                  merged[f"source_{level}"])
+
+    merged["candidate_article_id"] = merged["source_article_id"].astype(str)
+
+    print()
+    print(f"  => {name}의 후보가 원본과 일치합니다. 기사 ID를 붙였습니다.")
+
+    return merged.drop(columns=[
+        "source_article_id", "source_c1", "source_c2", "source_c3",
+        "source_label",
+    ]), {"checks": checks, "unmatched": unmatched}
 
 
 # ---------------------------------------------------------------- 정렬 검증
@@ -171,34 +320,19 @@ def align(
         if level in direct.columns and level in generation.columns:
             check(f"candidate {level}", direct[level], generation[level])
 
-    # 기사 ID는 양쪽에 다 있을 때만 대조할 수 있다.
     article_column = "candidate_article_id"
-    article_status = "없음"
 
-    if article_column in direct.columns and article_column in generation.columns:
-        check("candidate_article_id", direct[article_column],
-              generation[article_column])
-        article_status = "양쪽 대조"
-    elif article_column in generation.columns:
-        article_status = "generation 쪽에만 있음 (대조 불가)"
-        print(f"  ----  candidate_article_id           "
-              f"direct 쪽에 없어 대조하지 못했습니다")
-    elif article_column in direct.columns:
-        article_status = "direct 쪽에만 있음 (대조 불가)"
-        print(f"  ----  candidate_article_id           "
-              f"generation 쪽에 없어 대조하지 못했습니다")
-    else:
-        print(f"  ----  candidate_article_id           "
-              f"양쪽 모두 없어 대조하지 못했습니다")
+    for name, frame in (("direct", direct), ("generation", generation)):
+        if article_column not in frame.columns:
+            raise ValueError(
+                f"{name}에 {article_column}이 없습니다. 원본 붙이기가 "
+                "먼저 끝났는지 확인하세요."
+            )
+
+    check("candidate_article_id", direct[article_column],
+          generation[article_column])
 
     print()
-
-    if article_status != "양쪽 대조":
-        print("  기사 ID를 양쪽에서 대조하지 못했습니다. 대신 impression,")
-        print("  후보 위치, label, (c1,c2,c3)로 확인했습니다. 진단에서")
-        print("  impression 안의 후보 5개는 c1c2c3가 항상 서로 달랐으므로")
-        print("  (impression, c1, c2, c3)가 후보를 유일하게 가리킵니다.")
-        print()
 
     if not all_ok:
         raise ValueError(
@@ -219,10 +353,7 @@ def align(
         "L3": generation["L3"].astype(np.float64),
     })
 
-    if article_column in generation.columns:
-        merged[article_column] = generation[article_column]
-    elif article_column in direct.columns:
-        merged[article_column] = direct[article_column]
+    merged[article_column] = direct[article_column]
 
     merged["G"] = (
         G_WEIGHTS[0] * merged["L1"]
@@ -230,11 +361,7 @@ def align(
         + G_WEIGHTS[2] * merged["L3"]
     )
 
-    return merged, {
-        "checks": checks,
-        "all_passed": all_ok,
-        "article_id_status": article_status,
-    }
+    return merged, {"checks": checks, "all_passed": all_ok}
 
 
 # ---------------------------------------------------------------- z-normalize
@@ -274,6 +401,76 @@ def evaluate_scores(
         "ndcg5": metrics["ndcg@5"],
         "auc": metrics["auc"],
         "num_impressions": metrics["num_impressions"],
+    }
+
+
+def impression_ranks(scores: np.ndarray, num_impressions: int) -> np.ndarray:
+    """impression 안에서 점수 내림차순 순위. 동점은 안정 정렬로 가른다."""
+    grid = scores.reshape(num_impressions, NUM_CANDIDATES)
+    order = np.argsort(-grid, axis=1, kind="stable")
+
+    ranks = np.empty_like(order)
+    positions = np.arange(NUM_CANDIDATES)
+
+    for i in range(num_impressions):
+        ranks[i, order[i]] = positions
+
+    return ranks
+
+
+def check_endpoint(
+    name: str, raw: np.ndarray, z: np.ndarray,
+    ordered: pd.DataFrame, num_impressions: int,
+    past_reference: float,
+) -> Dict[str, Any]:
+    """z 적용 전후가 같은 순위를 내는지, metric이 같은지 본다.
+
+    기준은 입력 파일에서 직접 다시 계산한 raw metric이다. 예전 실행의
+    수치는 참고로 같이 보여주기만 한다.
+    """
+    raw_metrics = evaluate_scores(ordered, raw)
+    z_metrics = evaluate_scores(ordered, z)
+
+    raw_ranks = impression_ranks(raw, num_impressions)
+    z_ranks = impression_ranks(z, num_impressions)
+
+    changed = int((raw_ranks != z_ranks).any(axis=1).sum())
+
+    deltas = {
+        key: abs(z_metrics[key] - raw_metrics[key])
+        for key in ("top1_accuracy", "mrr", "ndcg5", "auc")
+    }
+
+    worst = max(deltas.values())
+    passed = changed == 0 and worst <= REPRODUCE_TOLERANCE
+
+    print(f"  {name}")
+    print(f"    {'':<14} {'raw':>14} {'z 적용 후':>14} {'차이':>12}")
+    print(f"    " + "-" * 56)
+
+    for label, key in (
+        ("Top-1", "top1_accuracy"), ("MRR", "mrr"),
+        ("nDCG@5", "ndcg5"), ("AUC", "auc"),
+    ):
+        print(f"    {label:<14} {raw_metrics[key]:>14.10f} "
+              f"{z_metrics[key]:>14.10f} {deltas[key]:>12.3e}")
+
+    print()
+    print(f"    후보 순위가 바뀐 impression : {changed:,} / "
+          f"{num_impressions:,}")
+    print(f"    판정 : {'OK' if passed else 'FAIL'}")
+    print(f"    (참고) 예전 실행 값 : {past_reference * 100:.3f}%  "
+          f"— 합격 기준이 아닙니다")
+    print()
+
+    return {
+        "name": name,
+        "raw": raw_metrics,
+        "z": z_metrics,
+        "deltas": deltas,
+        "ranks_changed": changed,
+        "passed": passed,
+        "past_reference": past_reference,
     }
 
 
@@ -320,83 +517,69 @@ def print_lambda_table(rows: List[Dict[str, Any]]) -> None:
         )
 
 
-def print_agreement(agreement: Dict[str, Any], total: int) -> None:
-    section("G와 D가 서로 다른 것을 맞히는가")
+def print_agreement(agreement: Dict[str, Any]) -> None:
+    section("G와 D의 정답 분포")
+
+    total = agreement["total"]
 
     print(f"  {'':<26} {'impression':>12} {'비율':>9}")
     print("  " + "-" * 50)
 
     for label, key in (
-        ("G 정답 / D 정답", "both_correct"),
-        ("G 정답 / D 오답", "g_only"),
-        ("G 오답 / D 정답", "d_only"),
-        ("G 오답 / D 오답", "both_wrong"),
+        ("G correct / D correct", "both_correct"),
+        ("G correct / D wrong", "g_only"),
+        ("G wrong   / D correct", "d_only"),
+        ("G wrong   / D wrong", "both_wrong"),
     ):
         count = agreement[key]
         print(f"  {label:<26} {count:>12,} {100 * count / total:>8.2f}%")
 
     print()
-    print(f"  G 단독 Top-1 : {agreement['g_top1'] * 100:.3f}%")
-    print(f"  D 단독 Top-1 : {agreement['d_top1'] * 100:.3f}%")
-    print(f"  둘 중 하나라도 맞힌 비율 (상한) : "
-          f"{agreement['union'] * 100:.3f}%")
-    print(f"  둘 다 맞힌 비율 (교집합)        : "
-          f"{agreement['both_correct'] / total * 100:.3f}%")
+    print(f"  {'D-only correct / 전체 Validation':<44} "
+          f"{agreement['d_only']:>8,} / {total:,}  "
+          f"({agreement['d_only_of_total'] * 100:.2f}%)")
+
+    g_wrong = agreement["g_only"] + agreement["both_wrong"]
+
+    print(f"  {'D-only correct / G가 틀린 subset':<44} "
+          f"{agreement['d_only']:>8,} / {g_wrong:,}  "
+          f"({agreement['d_only_of_g_wrong'] * 100:.2f}%)")
 
     print()
-
-    d_only = agreement["d_only"] / total
-
-    print(f"  D만 맞힌 impression : {agreement['d_only']:,} "
-          f"({d_only * 100:.2f}%)")
-
-    if d_only < 0.02:
-        print("  => 2% 미만입니다. D가 G와 거의 같은 것을 맞히고 있습니다.")
-        print("     direct score는 generation score의 약한 복제에 가깝습니다.")
-    elif d_only < 0.05:
-        print("  => 적지만 없지는 않습니다. hybrid가 얼마나 살리는지 보세요.")
-    else:
-        print("  => 무시할 수 없는 양입니다. D가 G가 놓치는 것을 잡고 있습니다.")
-        print("     Train에서 fusion weight를 학습할 값이 있습니다.")
+    print(f"  {'oracle union Top-1':<32} "
+          f"{agreement['union'] * 100:>9.3f}%")
+    print(f"  {'G Top-1':<32} {agreement['g_top1'] * 100:>9.3f}%")
+    print(f"  {'D Top-1':<32} {agreement['d_top1'] * 100:>9.3f}%")
+    print(f"  {'best Hybrid Top-1':<32} "
+          f"{agreement['best_hybrid_top1'] * 100:>9.3f}%  "
+          f"(lambda {agreement['best_lambda']:g})")
+    print(f"  {'best Hybrid - G':<32} "
+          f"{agreement['best_hybrid_minus_g'] * 100:>+9.3f}%p")
 
     print()
-    print(f"  상한 {agreement['union'] * 100:.3f}%는 두 score를 완벽하게")
-    print(f"  골라 썼을 때의 Top-1입니다. hybrid 최고가 여기서 얼마나")
-    print(f"  떨어져 있는지가 fusion의 여지를 보여줍니다.")
+    print("  oracle union은 두 score 중 맞힌 쪽을 매번 골랐을 때의 Top-1로,")
+    print("  어떤 fusion도 넘을 수 없는 상한입니다.")
 
 
 def print_correlation(correlation: Dict[str, float]) -> None:
     section("D와 G의 상관")
 
-    print(f"  {'':<34} {'Pearson':>10} {'Spearman':>10}")
+    print(f"  {'기준':<34} {'Pearson':>10} {'Spearman':>10}")
     print("  " + "-" * 56)
-    print(f"  {'후보 전체 (raw score)':<34} "
-          f"{correlation['pearson_raw']:>10.4f} "
-          f"{correlation['spearman_raw']:>10.4f}")
-    print(f"  {'후보 전체 (impression 내 z)':<34} "
-          f"{correlation['pearson_z']:>10.4f} "
-          f"{correlation['spearman_z']:>10.4f}")
-    print(f"  {'impression별 평균':<34} "
-          f"{correlation['pearson_per_impression']:>10.4f} "
-          f"{correlation['spearman_per_impression']:>10.4f}")
+
+    for label, pearson_key, spearman_key in (
+        ("raw", "pearson_raw", "spearman_raw"),
+        ("z-score", "pearson_z", "spearman_z"),
+        ("impression-level", "pearson_per_impression",
+         "spearman_per_impression"),
+    ):
+        print(f"  {label:<34} {correlation[pearson_key]:>10.4f} "
+              f"{correlation[spearman_key]:>10.4f}")
 
     print()
-    print("  impression 안에서 재는 값이 ranking에 직접 관련됩니다.")
-    print("  raw score는 impression마다 scale이 달라 상관이 부풀 수 있습니다.")
-
-    value = correlation["spearman_per_impression"]
-
-    print()
-
-    if value > 0.8:
-        print(f"  impression별 Spearman {value:.4f} — 두 score가 거의 같은")
-        print("  순서를 매깁니다. 합쳐도 얻을 것이 적습니다.")
-    elif value > 0.5:
-        print(f"  impression별 Spearman {value:.4f} — 상당히 겹치지만")
-        print("  다른 부분도 있습니다.")
-    else:
-        print(f"  impression별 Spearman {value:.4f} — 두 score가 꽤 다른")
-        print("  순서를 매깁니다. 합칠 여지가 있습니다.")
+    print("  raw와 z-score는 후보 전체를 한 번에 본 값이고,")
+    print("  impression-level은 impression마다 계산해 평균한 값입니다.")
+    print("  ranking에 직접 관련되는 것은 impression-level입니다.")
 
 
 def print_comparison(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -404,12 +587,15 @@ def print_comparison(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     best = max(rows, key=lambda r: r["top1_accuracy"])
 
+    g_row = next(r for r in rows if r["lambda"] == 0.0)
+    d_row = next(r for r in rows if r["lambda"] == 1.0)
+
     table = [
-        ("Random", RANDOM_TOP1, ""),
-        ("V1 equal  L1+L2+L3", V1_EQUAL_TOP1, "생성확률 동일 가중"),
-        ("P2 Direct", D_REFERENCE_TOP1, "u^T W v"),
-        ("V1 weighted G  L1+0.5L2+0.1L3", G_REFERENCE_TOP1,
-         "Validation에서 탐색한 weight"),
+        ("Random", RANDOM_TOP1, "이론값"),
+        ("P2 Direct  D (이번 입력)", d_row["top1_accuracy"],
+         "lambda=1"),
+        ("V1 weighted G (이번 입력)", g_row["top1_accuracy"],
+         "lambda=0"),
         (f"Hybrid best  lambda={best['lambda']:g}",
          best["top1_accuracy"], "이번 진단"),
     ]
@@ -417,8 +603,12 @@ def print_comparison(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     for name, value, note in table:
         print(f"  {name:<36} {value * 100:>8.3f}%   {note}")
 
-    g_row = next(r for r in rows if r["lambda"] == 0.0)
-    d_row = next(r for r in rows if r["lambda"] == 1.0)
+    print()
+    print("  참고값 (예전 실행. 이번 검증 기준이 아닙니다)")
+    print(f"    {'V1 equal  L1+L2+L3':<34} "
+          f"{V1_EQUAL_REFERENCE * 100:>8.3f}%")
+    print(f"    {'V1 weighted G':<34} {G_PAST_REFERENCE * 100:>8.3f}%")
+    print(f"    {'P2 Direct':<34} {D_PAST_REFERENCE * 100:>8.3f}%")
 
     print()
     print(f"  best lambda : {best['lambda']:g}")
@@ -436,7 +626,7 @@ def print_comparison(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
 def write_readme(
     path: Path, rows: List[Dict[str, Any]], agreement: Dict[str, Any],
     correlation: Dict[str, float], alignment: Dict[str, Any],
-    reproduction: Dict[str, Any], best: Dict[str, Any],
+    endpoint_checks: List[Dict[str, Any]], best: Dict[str, Any],
     metadata: Dict[str, Any],
 ) -> None:
     lines: List[str] = []
@@ -467,6 +657,26 @@ def write_readme(
     add("추정치가 아니라 development diagnostic이다.")
     add("")
 
+    add("## 핵심 결과")
+    add("")
+    total = agreement["total"]
+    add(f"1. **G wrong / D correct** : "
+        f"**{agreement['d_only']:,}** impression "
+        f"(전체의 {agreement['d_only_of_total'] * 100:.2f}%, "
+        f"G가 틀린 것 중 {agreement['d_only_of_g_wrong'] * 100:.2f}%)")
+    add(f"2. **oracle union Top-1** : "
+        f"**{agreement['union'] * 100:.3f}%** "
+        f"(G {agreement['g_top1'] * 100:.3f}%, "
+        f"D {agreement['d_top1'] * 100:.3f}%)")
+    add(f"3. **best Hybrid Top-1** : "
+        f"**{agreement['best_hybrid_top1'] * 100:.3f}%** "
+        f"(lambda {agreement['best_lambda']:g}), "
+        f"G 대비 **{agreement['best_hybrid_minus_g'] * 100:+.3f}%p**")
+    add("")
+    add("oracle union은 두 score 중 맞힌 쪽을 매번 골랐을 때의 Top-1로,")
+    add("어떤 fusion도 넘을 수 없는 상한이다.")
+    add("")
+
     add("## 실행 정보")
     add("")
     add(f"- direct score  : `{metadata['direct_path']}`")
@@ -476,7 +686,28 @@ def write_readme(
     add(f"- git commit    : {metadata.get('git_commit')}")
     add("")
 
-    add("## 정렬 검증")
+    add("## 원본 대조")
+    add("")
+    add("기사 ID는 예측 파일이 아니라 모델에 실제로 들어간 원본")
+    add(f"`{alignment['source_path']}`에서 가져왔다.")
+    add("`(impression_id, 후보 위치)`로 붙인 뒤, 각 예측이 들고 있던")
+    add("`label`과 `(c1,c2,c3)`가 원본과 같은지 확인했다.")
+    add("")
+
+    for name, key in (("direct", "direct_vs_source"),
+                      ("generation", "generation_vs_source")):
+        add(f"**{name}**")
+        add("")
+        add("| 항목 | 불일치 | 판정 |")
+        add("|---|---|---|")
+
+        for check in alignment[key]["checks"]:
+            add(f"| {check['field']} | {check['mismatched']:,} | "
+                f"{'OK' if check['passed'] else 'FAIL'} |")
+
+        add("")
+
+    add("## 정렬 검증  (direct vs generation)")
     add("")
     add("| 항목 | 불일치 | 판정 |")
     add("|---|---|---|")
@@ -486,31 +717,33 @@ def write_readme(
             f"{'OK' if check['passed'] else 'FAIL'} |")
 
     add("")
-    add(f"candidate_article_id: {alignment['article_id_status']}")
+
+    add("## 끝점 검증")
+    add("")
+    add("z-normalize는 impression 안의 affine 변환이라 순위를 바꾸지 않아야")
+    add("한다. 기준은 **이번에 읽은 입력 파일에서 직접 다시 계산한 raw**")
+    add("metric이다. 예전 실행 수치는 참고로만 적는다.")
     add("")
 
-    if alignment["article_id_status"] != "양쪽 대조":
-        add("기사 ID를 양쪽에서 대조하지는 못했다. 대신 impression, 후보 위치,")
-        add("label, `(c1,c2,c3)`로 확인했다. 진단에서 impression 안의 후보")
-        add("5개는 `c1c2c3`가 항상 서로 달랐으므로 `(impression, c1, c2, c3)`가")
-        add("후보를 유일하게 가리킨다.")
+    for item in endpoint_checks:
+        add(f"**{item['name']}**")
         add("")
+        add("| 지표 | raw | z 적용 후 | 차이 |")
+        add("|---|---|---|---|")
 
-    add("## 끝점 재현")
-    add("")
-    add("z-normalize는 impression 안의 affine 변환이라 순위를 바꾸지 않는다.")
-    add("따라서 두 끝점은 기존 결과를 그대로 재현해야 한다.")
-    add("")
-    add("| 끝점 | 기준값 | 이번 값 | 차이 | 판정 |")
-    add("|---|---|---|---|---|")
+        for label, key in (
+            ("Top-1", "top1_accuracy"), ("MRR", "mrr"),
+            ("nDCG@5", "ndcg5"), ("AUC", "auc"),
+        ):
+            add(f"| {label} | {item['raw'][key]:.10f} | "
+                f"{item['z'][key]:.10f} | {item['deltas'][key]:.3e} |")
 
-    for item in reproduction["checks"]:
-        add(f"| {item['name']} | {item['reference'] * 100:.3f}% | "
-            f"{item['actual'] * 100:.3f}% | "
-            f"{item['deviation'] * 100:.4f}%p | "
-            f"{'OK' if item['passed'] else '허용치 밖'} |")
-
-    add("")
+        add("")
+        add(f"- 후보 순위가 바뀐 impression : {item['ranks_changed']:,}")
+        add(f"- 판정 : {'OK' if item['passed'] else 'FAIL'}")
+        add(f"- (참고) 예전 실행 값 : "
+            f"{item['past_reference'] * 100:.3f}% — 합격 기준이 아니다")
+        add("")
 
     add("## lambda sweep")
     add("")
@@ -553,46 +786,65 @@ def write_readme(
             f"{100 * agreement[key] / total:.2f}% |")
 
     add("")
-    add(f"- G 단독 Top-1 : {agreement['g_top1'] * 100:.3f}%")
-    add(f"- D 단독 Top-1 : {agreement['d_top1'] * 100:.3f}%")
-    add(f"- 둘 중 하나라도 맞힌 비율 (상한) : "
-        f"{agreement['union'] * 100:.3f}%")
-    add("")
-    add("상한은 두 score를 완벽하게 골라 썼을 때의 Top-1이다. hybrid")
-    add("최고가 여기서 얼마나 떨어져 있는지가 fusion의 여지를 보여준다.")
+    add("| 항목 | 값 |")
+    add("|---|---|")
+    add(f"| D-only correct / 전체 Validation | "
+        f"{agreement['d_only']:,} / {agreement['total']:,} "
+        f"({agreement['d_only_of_total'] * 100:.2f}%) |")
+    add(f"| D-only correct / G가 틀린 subset | "
+        f"{agreement['d_only']:,} / "
+        f"{agreement['g_only'] + agreement['both_wrong']:,} "
+        f"({agreement['d_only_of_g_wrong'] * 100:.2f}%) |")
+    add(f"| oracle union Top-1 | {agreement['union'] * 100:.3f}% |")
+    add(f"| G Top-1 | {agreement['g_top1'] * 100:.3f}% |")
+    add(f"| D Top-1 | {agreement['d_top1'] * 100:.3f}% |")
+    add(f"| best Hybrid Top-1 | "
+        f"{agreement['best_hybrid_top1'] * 100:.3f}% "
+        f"(lambda {agreement['best_lambda']:g}) |")
+    add(f"| best Hybrid - G | "
+        f"{agreement['best_hybrid_minus_g'] * 100:+.3f}%p |")
     add("")
 
     add("## D와 G의 상관")
     add("")
     add("| 기준 | Pearson | Spearman |")
     add("|---|---|---|")
-    add(f"| 후보 전체 (raw score) | {correlation['pearson_raw']:.4f} | "
+    add(f"| raw | {correlation['pearson_raw']:.4f} | "
         f"{correlation['spearman_raw']:.4f} |")
-    add(f"| 후보 전체 (impression 내 z) | {correlation['pearson_z']:.4f} | "
+    add(f"| z-score | {correlation['pearson_z']:.4f} | "
         f"{correlation['spearman_z']:.4f} |")
-    add(f"| impression별 평균 | "
+    add(f"| impression-level | "
         f"{correlation['pearson_per_impression']:.4f} | "
         f"{correlation['spearman_per_impression']:.4f} |")
     add("")
-    add("impression 안에서 재는 값이 ranking에 직접 관련된다. raw score는")
-    add("impression마다 scale이 달라 상관이 부풀 수 있다.")
+    add("raw와 z-score는 후보 전체를 한 번에 본 값이고, impression-level은")
+    add("impression마다 계산해 평균한 값이다. ranking에 직접 관련되는 것은")
+    add("impression-level이다.")
     add("")
 
     add("## 비교")
     add("")
+    g_row = next(r for r in rows if r["lambda"] == 0.0)
+    d_row = next(r for r in rows if r["lambda"] == 1.0)
+
     add("| 구분 | Top-1 | 비고 |")
     add("|---|---|---|")
-    add(f"| Random | {RANDOM_TOP1 * 100:.2f}% | |")
-    add(f"| P2 Direct | {D_REFERENCE_TOP1 * 100:.3f}% | `u^T W v` |")
-    add(f"| V1 equal L1+L2+L3 | {V1_EQUAL_TOP1 * 100:.3f}% | 생성확률 동일 가중 |")
-    add(f"| V1 weighted G | {G_REFERENCE_TOP1 * 100:.3f}% | "
-        f"Validation에서 탐색한 weight |")
+    add(f"| Random | {RANDOM_TOP1 * 100:.2f}% | 이론값 |")
+    add(f"| P2 Direct D | {d_row['top1_accuracy'] * 100:.3f}% | "
+        f"이번 입력, lambda=1 |")
+    add(f"| V1 weighted G | {g_row['top1_accuracy'] * 100:.3f}% | "
+        f"이번 입력, lambda=0 |")
     add(f"| **Hybrid best** (lambda={best['lambda']:g}) | "
         f"{best['top1_accuracy'] * 100:.3f}% | 이번 진단 |")
     add("")
-
-    g_row = next(r for r in rows if r["lambda"] == 0.0)
-    d_row = next(r for r in rows if r["lambda"] == 1.0)
+    add("참고값 (예전 실행. 이번 검증 기준이 아니다)")
+    add("")
+    add("| 구분 | Top-1 |")
+    add("|---|---|")
+    add(f"| V1 equal L1+L2+L3 | {V1_EQUAL_REFERENCE * 100:.3f}% |")
+    add(f"| V1 weighted G | {G_PAST_REFERENCE * 100:.3f}% |")
+    add(f"| P2 Direct | {D_PAST_REFERENCE * 100:.3f}% |")
+    add("")
 
     add(f"- best lambda : {best['lambda']:g}")
     add(f"- G 대비 : "
@@ -631,6 +883,13 @@ def main() -> int:
         help="생략하면 priority0-dir의 candidate_scores.parquet",
     )
     parser.add_argument(
+        "--validation-path", default=None,
+        help=(
+            "원본 validation parquet. 생략하면 Priority 0 metadata의 "
+            "dataset을 쓴다. 여기서 candidate_article_ids를 가져온다."
+        ),
+    )
+    parser.add_argument(
         "--out",
         default="sweep_out/ebnerd_v2/priority2_direct/score_fusion",
     )
@@ -642,10 +901,26 @@ def main() -> int:
     direct_path = resolve_path(args.direct)
     out_dir = resolve_path(args.out)
 
+    priority0_dir = resolve_path(args.priority0_dir)
+
     generation_path = (
         resolve_path(args.generation) if args.generation
-        else resolve_path(args.priority0_dir) / "candidate_scores.parquet"
+        else priority0_dir / "candidate_scores.parquet"
     )
+
+    if args.validation_path:
+        validation_path = resolve_path(args.validation_path)
+    else:
+        meta_path = priority0_dir / "run_metadata.json"
+
+        if not meta_path.exists():
+            print(f"Priority 0 run_metadata.json이 없습니다: {meta_path}")
+            print("--validation-path로 원본 parquet을 지정하세요.")
+            return 1
+
+        validation_path = resolve_path(
+            json.loads(meta_path.read_text(encoding="utf-8"))["dataset"]
+        )
 
     section("score fusion diagnostic")
 
@@ -656,6 +931,7 @@ def main() -> int:
     for path, label in (
         (direct_path, "direct score parquet"),
         (generation_path, "generation score parquet"),
+        (validation_path, "원본 validation parquet"),
     ):
         if not path.exists():
             print(f"{label}가 없습니다: {path}")
@@ -663,6 +939,7 @@ def main() -> int:
 
     print(f"  direct     : {direct_path}")
     print(f"  generation : {generation_path}")
+    print(f"  원본       : {validation_path}")
     print(f"  출력       : {out_dir}")
     print()
     print("  재학습하지 않습니다. 추론하지 않습니다. Test를 쓰지 않습니다.")
@@ -678,7 +955,24 @@ def main() -> int:
             print(f"{name} parquet에 {column}이 없습니다.")
             return 1
 
+    # 원본 validation parquet에서 기사 ID를 가져온다.
+    # 예측 파일이 아니라 모델에 실제로 들어간 데이터다.
+    source = load_candidate_source(validation_path)
+
+    print()
+    print(f"  원본 후보 {len(source):,}개 "
+          f"(impression {len(source) // NUM_CANDIDATES:,})")
+
+    direct, direct_source_check = attach_source(direct, source, "direct")
+    generation, generation_source_check = attach_source(
+        generation, source, "generation"
+    )
+
     merged, alignment = align(direct, generation)
+
+    alignment["source_path"] = str(validation_path)
+    alignment["direct_vs_source"] = direct_source_check
+    alignment["generation_vs_source"] = generation_source_check
 
     num_impressions = len(merged) // NUM_CANDIDATES
 
@@ -731,49 +1025,50 @@ def main() -> int:
         print(f"  lambda {value:>4.1f}  Top-1 {metrics['top1_accuracy'] * 100:6.3f}%  "
               f"MRR {metrics['mrr']:.4f}  AUC {metrics['auc']:.4f}")
 
-    # ---- 끝점 재현
-    section("끝점 재현")
+    # ---- 끝점 검증
+    section("끝점 검증  (입력 파일에서 직접 다시 계산한 raw 기준)")
 
-    g_row = next(r for r in rows if r["lambda"] == 0.0)
-    d_row = next(r for r in rows if r["lambda"] == 1.0)
+    print("  z-normalize는 impression 안의 affine 변환이라 순위를 바꾸지")
+    print("  않아야 합니다. 같은 입력 파일에서 raw로 계산한 값과 z를 거친")
+    print("  값을 대조합니다. 예전 실행 수치는 참고로만 보여줍니다.")
+    print()
 
-    raw_g = evaluate_scores(ordered, g_values)
-    raw_d = evaluate_scores(ordered, d_values)
+    endpoint_checks = [
+        check_endpoint(
+            "lambda=0  (G, generation)", g_values, zg,
+            ordered, num_impressions, G_PAST_REFERENCE,
+        ),
+        check_endpoint(
+            "lambda=1  (D, direct)", d_values, zd,
+            ordered, num_impressions, D_PAST_REFERENCE,
+        ),
+    ]
 
-    repro_checks = []
+    for item, value in zip(endpoint_checks, (0.0, 1.0)):
+        row = next(r for r in rows if r["lambda"] == value)
+        delta = abs(row["top1_accuracy"] - item["z"]["top1_accuracy"])
+        item["sweep_delta"] = delta
 
-    for name, zrow, raw, reference in (
-        ("lambda=0 (G)", g_row, raw_g, G_REFERENCE_TOP1),
-        ("lambda=1 (D)", d_row, raw_d, D_REFERENCE_TOP1),
-    ):
-        # z 정규화가 순위를 바꾸지 않았는지 먼저 본다.
-        internal = abs(zrow["top1_accuracy"] - raw["top1_accuracy"])
-        external = abs(zrow["top1_accuracy"] - reference)
+        if delta > REPRODUCE_TOLERANCE:
+            print(f"  !! sweep의 lambda={value:g}이 끝점 계산과 다릅니다 "
+                  f"({delta:.3e})")
 
-        repro_checks.append({
-            "name": name,
-            "reference": reference,
-            "actual": zrow["top1_accuracy"],
-            "raw": raw["top1_accuracy"],
-            "deviation": external,
-            "z_vs_raw": internal,
-            "passed": external <= 5e-4,
-        })
+    endpoints_ok = all(item["passed"] for item in endpoint_checks)
 
-        print(f"  {name}")
-        print(f"    z 적용 후      {zrow['top1_accuracy'] * 100:.4f}%")
-        print(f"    raw score      {raw['top1_accuracy'] * 100:.4f}%")
-        print(f"    z vs raw 차이  {internal * 100:.6f}%p  "
-              f"{'(순위 보존)' if internal <= REPRODUCE_TOLERANCE else '(순위가 바뀜)'}")
-        print(f"    기존 기준값    {reference * 100:.4f}%")
-        print(f"    기준값 차이    {external * 100:.4f}%p")
-        print()
-
-    reproduction = {"checks": repro_checks}
+    if endpoints_ok:
+        print("  => 두 끝점 모두 raw와 순위, metric이 같습니다.")
+    else:
+        print("  => 끝점이 raw와 다릅니다. 아래 결과를 해석하기 전에")
+        print("     원인을 확인하세요.")
 
     # ---- 정답 분포
     d_correct = correct_mask(d_values, labels, num_impressions)
     g_correct = correct_mask(g_values, labels, num_impressions)
+
+    best = max(rows, key=lambda r: r["top1_accuracy"])
+    g_row = next(r for r in rows if r["lambda"] == 0.0)
+
+    g_wrong_count = int((~g_correct).sum())
 
     agreement = {
         "total": num_impressions,
@@ -784,9 +1079,19 @@ def main() -> int:
         "g_top1": float(g_correct.mean()),
         "d_top1": float(d_correct.mean()),
         "union": float((g_correct | d_correct).mean()),
+        "best_lambda": best["lambda"],
+        "best_hybrid_top1": best["top1_accuracy"],
+        "best_hybrid_minus_g": (
+            best["top1_accuracy"] - g_row["top1_accuracy"]
+        ),
     }
 
-    print_agreement(agreement, num_impressions)
+    agreement["d_only_of_total"] = agreement["d_only"] / num_impressions
+    agreement["d_only_of_g_wrong"] = (
+        agreement["d_only"] / g_wrong_count if g_wrong_count else float("nan")
+    )
+
+    print_agreement(agreement)
 
     # ---- 상관
     d_grid = d_values.reshape(num_impressions, NUM_CANDIDATES)
@@ -826,7 +1131,7 @@ def main() -> int:
     print_correlation(correlation)
 
     print_lambda_table(rows)
-    best = print_comparison(rows)
+    print_comparison(rows)
 
     # ---- 저장
     section("저장")
@@ -851,6 +1156,7 @@ def main() -> int:
         "experiment": "score_fusion_diagnostic",
         "direct_path": str(direct_path),
         "generation_path": str(generation_path),
+        "validation_path": str(validation_path),
         "g_weights": list(G_WEIGHTS),
         "g_formula": (
             f"L1 + {G_WEIGHTS[1]:g}*L2 + {G_WEIGHTS[2]:g}*L3"
@@ -863,7 +1169,8 @@ def main() -> int:
         "num_rows": int(len(merged)),
         "degenerate_impressions": {"D": degenerate_d, "G": degenerate_g},
         "alignment": alignment,
-        "reproduction": reproduction,
+        "endpoint_checks": endpoint_checks,
+        "endpoints_passed": endpoints_ok,
         "lambda_results": rows,
         "agreement": agreement,
         "correlation": correlation,
@@ -890,7 +1197,7 @@ def main() -> int:
 
     write_readme(
         out_dir / "README.md", rows, agreement, correlation,
-        alignment, reproduction, best, metadata,
+        alignment, endpoint_checks, best, metadata,
     )
 
     for name in sorted(p.name for p in out_dir.iterdir()):
