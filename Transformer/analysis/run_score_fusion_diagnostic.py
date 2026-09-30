@@ -246,10 +246,52 @@ def attach_source(
             check(f"candidate {level}", merged[level],
                   merged[f"source_{level}"])
 
-    merged["candidate_article_id"] = merged["source_article_id"].astype(str)
+    source_article_id = merged["source_article_id"].astype(str)
+
+    # 예측이 스스로 들고 온 기사 ID가 있으면 원본과 대조한다. 이 값은
+    # dataloader가 모델에 실제로 넣어 준 것이라, 원본에서 붙인 값과
+    # 독립적인 증거다. 없으면 (article_id 저장 전에 만든 예측이면)
+    # 건너뛴다. 어느 쪽이든 최종 기사 ID는 원본 값을 쓴다.
+    own = merged.get("candidate_article_id")
+    own_present = own is not None and int(own.notna().sum()) > 0
+
+    if own_present:
+        a = own.astype(str).to_numpy()
+        b = source_article_id.to_numpy()
+        mismatched = int((a != b).sum())
+
+        checks.append({
+            "field": "candidate_article_id (예측 자체)",
+            "mismatched": mismatched, "passed": mismatched == 0,
+        })
+
+        print(f"  {'OK  ' if mismatched == 0 else 'FAIL'}  "
+              f"{'candidate_article_id (예측 자체)':<28} "
+              f"불일치 {mismatched:,} / {len(a):,}")
+
+        if mismatched:
+            raise ValueError(
+                f"{name}이 저장한 기사 ID가 원본과 다릅니다 "
+                f"({mismatched:,}개). 예측이 원본과 다른 후보를 "
+                "가리킵니다."
+            )
+    else:
+        checks.append({
+            "field": "candidate_article_id (예측 자체)",
+            "mismatched": None, "passed": None,
+        })
+        print(f"  --    {'candidate_article_id (예측 자체)':<28} "
+              f"예측에 없어 건너뜀")
+
+    merged["candidate_article_id"] = source_article_id
 
     print()
     print(f"  => {name}의 후보가 원본과 일치합니다. 기사 ID를 붙였습니다.")
+
+    if not own_present:
+        print(f"     ({name} 예측에는 기사 ID가 없어 원본 값만 씁니다. "
+              "그 예측을 기사 ID까지 저장하도록 다시 만들면 "
+              "교차 확인됩니다.)")
 
     return merged.drop(columns=[
         "source_article_id", "source_c1", "source_c2", "source_c3",
@@ -693,6 +735,10 @@ def write_readme(
     add("`(impression_id, 후보 위치)`로 붙인 뒤, 각 예측이 들고 있던")
     add("`label`과 `(c1,c2,c3)`가 원본과 같은지 확인했다.")
     add("")
+    add("예측이 스스로 저장한 `candidate_article_id`는 dataloader가 모델에")
+    add("넣어 준 값이라, 원본에서 붙인 값과 독립적인 증거다. 예측에 그")
+    add("컬럼이 있으면 같이 대조하고, 없으면 건너뛴다.")
+    add("")
 
     for name, key in (("direct", "direct_vs_source"),
                       ("generation", "generation_vs_source")):
@@ -702,8 +748,11 @@ def write_readme(
         add("|---|---|---|")
 
         for check in alignment[key]["checks"]:
-            add(f"| {check['field']} | {check['mismatched']:,} | "
-                f"{'OK' if check['passed'] else 'FAIL'} |")
+            if check["mismatched"] is None:
+                add(f"| {check['field']} | - | 예측에 없어 건너뜀 |")
+            else:
+                add(f"| {check['field']} | {check['mismatched']:,} | "
+                    f"{'OK' if check['passed'] else 'FAIL'} |")
 
         add("")
 
