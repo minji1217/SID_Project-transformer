@@ -109,6 +109,8 @@ def resolve_path(path: str) -> Path:
     return path_obj if path_obj.is_absolute() else BASE_DIR / path_obj
 
 
+HISTORY_FILTER_COLUMN = "history_c1"
+
 SOURCE_COLUMNS = [
     "impression_id",
     "candidate_article_ids",
@@ -120,14 +122,20 @@ SOURCE_COLUMNS = [
 def load_candidate_source(validation_path: Path) -> pd.DataFrame:
     """원본 validation parquet을 후보 단위로 편다.
 
-    impression 하나가 한 행이고 candidate_* 가 길이 5 배열이므로,
-    후보 위치를 보존한 채 펴서 (impression_id, candidate position)으로
-    찾을 수 있게 만든다. 예측 파일이 아니라 모델에 들어간 원본이다.
+    impression_id는 원본에서 유일하지 않으므로 키로 쓰지 않는다.
+    대신 예측이 들고 있는 `sample_index`를 쓴다. 이 값은 validation
+    loader를 shuffle 없이 돌 때의 일련번호이고, Dataset은 원본을 읽은
+    순서 그대로 두되 history가 빈 행만 건너뛴다. 그래서 같은 규칙으로
+    거르면 sample_index -> 원본 row를 그대로 되살릴 수 있다.
+
+    되살린 대응은 믿고 쓰는 게 아니라, 붙인 뒤 impression_id / label /
+    (c1,c2,c3) / (있으면) 기사 ID가 원본과 같은지로 확인한다.
     """
     available = set(
         pq.ParquetFile(validation_path).schema_arrow.names
     )
-    missing = [c for c in SOURCE_COLUMNS if c not in available]
+    needed = SOURCE_COLUMNS + [HISTORY_FILTER_COLUMN]
+    missing = [c for c in needed if c not in available]
 
     if missing:
         raise ValueError(
@@ -138,15 +146,31 @@ def load_candidate_source(validation_path: Path) -> pd.DataFrame:
             "(c1,c2,c3)를 대체키로 쓰지 않습니다."
         )
 
-    frame = pd.read_parquet(validation_path, columns=SOURCE_COLUMNS)
+    frame = pd.read_parquet(validation_path, columns=needed)
+
+    total_rows = len(frame)
+
+    # NewsSequenceDataset._build_sample_index와 같은 규칙.
+    # drop_empty_history는 gin에서 항상 True다.
+    keep = np.array([
+        row_index
+        for row_index, value in enumerate(frame[HISTORY_FILTER_COLUMN])
+        if len(np.asarray(value)) > 0
+    ], dtype=np.int64)
+
+    dropped = total_rows - len(keep)
+
+    print(f"  원본 row {total_rows:,}개")
+    print(f"  history가 빈 행 제외 {dropped:,}개")
+    print(f"  Dataset이 쓰는 sample {len(keep):,}개")
 
     duplicated = int(frame["impression_id"].duplicated().sum())
 
     if duplicated:
-        raise ValueError(
-            f"원본에 impression_id가 중복됩니다 ({duplicated:,}개). "
-            "impression_id로 대응시킬 수 없습니다."
-        )
+        print(f"  impression_id 중복 {duplicated:,}개 "
+              "-> 키로 쓰지 않고 확인용으로만 씁니다")
+
+    frame = frame.iloc[keep].reset_index(drop=True)
 
     def stack(column: str) -> np.ndarray:
         values = [np.asarray(v) for v in frame[column]]
@@ -169,11 +193,13 @@ def load_candidate_source(validation_path: Path) -> pd.DataFrame:
     num_rows = len(frame)
 
     return pd.DataFrame({
-        "impression_id": np.repeat(
-            frame["impression_id"].to_numpy(), NUM_CANDIDATES
-        ),
+        GROUP_COLUMN: np.repeat(np.arange(num_rows), NUM_CANDIDATES),
         "candidate_index": np.tile(
             np.arange(NUM_CANDIDATES), num_rows
+        ),
+        "source_row": np.repeat(keep, NUM_CANDIDATES),
+        "source_impression_id": np.repeat(
+            frame["impression_id"].to_numpy(), NUM_CANDIDATES
         ),
         "source_article_id": article_ids.reshape(-1),
         "source_c1": c1.reshape(-1).astype(np.int64),
@@ -183,21 +209,91 @@ def load_candidate_source(validation_path: Path) -> pd.DataFrame:
     })
 
 
+RAW_PREDICTION_GLOB = "validation_scores_*.parquet"
+
+
+def attach_own_article_id(
+    frame: pd.DataFrame, priority0_dir: Path
+) -> pd.DataFrame:
+    """generation 예측에 그 쪽 dataloader가 준 기사 ID를 붙인다.
+
+    candidate_scores.parquet은 기사 ID를 버리지만, 같은 폴더의 raw
+    예측(predict_sid.py 출력)에는 남아 있다. 이것은 원본에서 붙이는
+    값과 독립적인 증거이므로, 있으면 붙여서 확인 항목을 하나 늘린다.
+    원본 대조를 대신하지는 않는다. 없으면 그냥 건너뛴다.
+    """
+    if "candidate_article_id" in frame.columns:
+        return frame
+
+    candidates = sorted(priority0_dir.glob(RAW_PREDICTION_GLOB))
+
+    for path in candidates:
+        columns = set(pq.ParquetFile(path).schema_arrow.names)
+
+        if not {GROUP_COLUMN, "article_id"} <= columns:
+            continue
+
+        raw = pd.read_parquet(path, columns=[GROUP_COLUMN, "article_id"])
+        raw = raw.sort_values(GROUP_COLUMN, kind="stable").reset_index(drop=True)
+        raw["candidate_index"] = raw.groupby(GROUP_COLUMN).cumcount()
+
+        merged = frame.merge(
+            raw.rename(columns={"article_id": "candidate_article_id"}),
+            on=[GROUP_COLUMN, "candidate_index"],
+            how="left", validate="1:1",
+        )
+
+        if int(merged["candidate_article_id"].isna().sum()):
+            continue
+
+        print()
+        print(f"  generation 기사 ID를 raw 예측에서 읽었습니다: {path.name}")
+        print("  (원본 대조를 대신하지 않고, 확인 항목만 하나 늘립니다.)")
+
+        return merged
+
+    return frame
+
+
 def attach_source(
     frame: pd.DataFrame, source: pd.DataFrame, name: str
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """예측에 원본 기사 ID를 붙이고, 원본과 맞는지 확인한다.
 
-    (impression_id, candidate position)으로 붙인다. 붙인 뒤 예측이
-    들고 있던 c1/c2/c3/label이 원본과 같은지 본다. 여기가 맞으면
-    그 예측이 원본의 어느 후보를 매겼는지 확정된다.
+    키는 `(sample_index, candidate_index)`다. impression_id는 원본에서
+    유일하지 않으므로 (positive가 여럿인 impression을 positive마다
+    따로 편 행들이 같은 id를 유지한다) 키로 쓰지 않고, 붙인 뒤
+    맞는지 확인하는 항목으로만 쓴다. 중복 impression_id는 버리지
+    않는다.
+
+    붙인 뒤 예측이 들고 있던 impression_id / label / c1/c2/c3 /
+    (있으면) 기사 ID가 원본과 같은지 본다. 여기가 맞으면 그 예측이
+    원본의 어느 후보를 매겼는지 확정된다.
     """
     section(f"원본 대조 — {name}")
 
     before = len(frame)
 
+    for column in (GROUP_COLUMN, "candidate_index"):
+        if column not in frame.columns:
+            raise ValueError(
+                f"{name} 예측에 {column}이 없습니다. "
+                f"({GROUP_COLUMN}, candidate_index)로 붙일 수 없습니다."
+            )
+
+    duplicated_key = int(
+        frame.duplicated([GROUP_COLUMN, "candidate_index"]).sum()
+    )
+
+    if duplicated_key:
+        raise ValueError(
+            f"{name}에 ({GROUP_COLUMN}, candidate_index)가 중복됩니다 "
+            f"({duplicated_key:,}개). 후보를 유일하게 잡을 수 없습니다."
+        )
+
+    # validate="1:1"이 양쪽 키 중복을 다시 한 번 막는다.
     merged = frame.merge(
-        source, on=["impression_id", "candidate_index"],
+        source, on=[GROUP_COLUMN, "candidate_index"],
         how="left", validate="1:1",
     )
 
@@ -239,6 +335,8 @@ def attach_source(
                 "예측이 원본과 다른 후보를 가리킵니다."
             )
 
+    check("impression_id", merged["impression_id"],
+          merged["source_impression_id"])
     check("label", merged["label"], merged["source_label"])
 
     for level in ("c1", "c2", "c3"):
@@ -294,8 +392,8 @@ def attach_source(
               "교차 확인됩니다.)")
 
     return merged.drop(columns=[
-        "source_article_id", "source_c1", "source_c2", "source_c3",
-        "source_label",
+        "source_row", "source_impression_id", "source_article_id",
+        "source_c1", "source_c2", "source_c3", "source_label",
     ]), {"checks": checks, "unmatched": unmatched}
 
 
@@ -329,7 +427,8 @@ def align(
         [GROUP_COLUMN, "candidate_index"], kind="stable"
     ).reset_index(drop=True)
 
-    print(f"  row {len(direct):,}개, impression "
+    print(f"  키는 ({GROUP_COLUMN}, candidate_index)입니다.")
+    print(f"  row {len(direct):,}개, sample "
           f"{len(direct) // NUM_CANDIDATES:,}개")
     print()
 
@@ -352,9 +451,11 @@ def align(
         print(f"  {'OK  ' if ok else 'FAIL'}  {label:<28} "
               f"불일치 {mismatched:,} / {len(left):,}")
 
-    check("impression_id", direct["impression_id"], generation["impression_id"])
+    check("sample_index", direct[GROUP_COLUMN], generation[GROUP_COLUMN])
     check("candidate position", direct["candidate_index"],
           generation["candidate_index"])
+    # impression_id는 원본에서 유일하지 않다. 키가 아니라 확인 항목이다.
+    check("impression_id", direct["impression_id"], generation["impression_id"])
     check("label", direct["label"].astype(int),
           generation["label"].astype(int))
 
@@ -683,6 +784,10 @@ def write_readme(
     add(f"    G = V1 weighted generation score   "
         f"L1 + {G_WEIGHTS[1]:g}*L2 + {G_WEIGHTS[2]:g}*L3")
     add("")
+    add("G는 generation 파일의 `L1`/`L2`/`L3`에서 다시 계산한다. 그 파일의")
+    add("`candidate_score`와 `S123`은 `L1 + L2 + L3`이라 이번 G가 아니므로")
+    add("읽지 않는다.")
+    add("")
     add("impression 안의 후보 5개끼리 z-normalize한 뒤")
     add("")
     add("    H(lambda) = lambda * zD + (1 - lambda) * zG")
@@ -732,8 +837,17 @@ def write_readme(
     add("")
     add("기사 ID는 예측 파일이 아니라 모델에 실제로 들어간 원본")
     add(f"`{alignment['source_path']}`에서 가져왔다.")
-    add("`(impression_id, 후보 위치)`로 붙인 뒤, 각 예측이 들고 있던")
-    add("`label`과 `(c1,c2,c3)`가 원본과 같은지 확인했다.")
+    add("키는 `(sample_index, candidate_index)`다. `impression_id`는 원본에서")
+    add("유일하지 않다 — positive가 여럿인 impression을 positive마다 따로 편")
+    add("행들이 같은 id를 유지하기 때문이다. 그래서 키로 쓰지 않고 붙인 뒤")
+    add("확인하는 항목으로만 쓴다. 중복된 `impression_id`는 하나도 버리지")
+    add("않았다.")
+    add("")
+    add("`sample_index`는 shuffle 없이 도는 validation loader의 일련번호이고,")
+    add("Dataset은 원본을 읽은 순서를 지키되 history가 빈 행만 건너뛴다")
+    add("(`NewsSequenceDataset._build_sample_index`, `drop_empty_history=True`).")
+    add("같은 규칙으로 걸러 `sample_index -> 원본 row`를 되살린 뒤,")
+    add("`impression_id` / `label` / `(c1,c2,c3)` / 기사 ID로 확인했다.")
     add("")
     add("예측이 스스로 저장한 `candidate_article_id`는 dataloader가 모델에")
     add("넣어 준 값이라, 원본에서 붙인 값과 독립적인 증거다. 예측에 그")
@@ -1006,11 +1120,18 @@ def main() -> int:
 
     # 원본 validation parquet에서 기사 ID를 가져온다.
     # 예측 파일이 아니라 모델에 실제로 들어간 데이터다.
+    section("원본 읽기")
+
     source = load_candidate_source(validation_path)
 
     print()
-    print(f"  원본 후보 {len(source):,}개 "
-          f"(impression {len(source) // NUM_CANDIDATES:,})")
+    print(f"  후보 {len(source):,}개 "
+          f"(sample {len(source) // NUM_CANDIDATES:,})")
+
+    # generation은 candidate_scores.parquet에 기사 ID를 남기지 않지만,
+    # 같은 폴더의 raw 예측에는 dataloader가 준 값이 그대로 있다.
+    # 있으면 붙여서 generation도 direct와 같은 교차 확인을 받게 한다.
+    generation = attach_own_article_id(generation, priority0_dir)
 
     direct, direct_source_check = attach_source(direct, source, "direct")
     generation, generation_source_check = attach_source(
