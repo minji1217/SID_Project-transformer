@@ -86,11 +86,19 @@ def spearman(a: pd.Series, b: pd.Series) -> float:
     return float(a.rank().corr(b.rank(), method="pearson"))
 
 
+_STARTED_AT = time.time()
+
+
 def section(title: str) -> None:
     print()
     print("=" * 96)
-    print(title)
+    print(f"{title}   [+{time.time() - _STARTED_AT:.0f}s]")
     print("=" * 96)
+
+
+def step(message: str) -> None:
+    """오래 걸리는 단계 앞에 찍는다. 멈춘 게 아니라는 표시."""
+    print(f"  ... {message}  [+{time.time() - _STARTED_AT:.0f}s]")
 
 
 def git_commit_hash() -> Optional[str]:
@@ -146,9 +154,12 @@ def load_candidate_source(validation_path: Path) -> pd.DataFrame:
             "(c1,c2,c3)를 대체키로 쓰지 않습니다."
         )
 
+    step(f"원본 읽는 중: {validation_path.name}")
     frame = pd.read_parquet(validation_path, columns=needed)
 
     total_rows = len(frame)
+
+    step(f"history가 빈 행을 거르는 중 ({total_rows:,} row)")
 
     # NewsSequenceDataset._build_sample_index와 같은 규칙.
     # drop_empty_history는 gin에서 항상 True다.
@@ -183,6 +194,8 @@ def load_candidate_source(validation_path: Path) -> pd.DataFrame:
             )
 
         return np.stack(values)
+
+    step(f"후보 단위로 펴는 중 ({len(frame):,} sample)")
 
     article_ids = stack("candidate_article_ids")
     c1 = stack("candidate_c1")
@@ -228,6 +241,8 @@ def attach_own_article_id(
     candidates = sorted(priority0_dir.glob(RAW_PREDICTION_GLOB))
 
     for path in candidates:
+        step(f"generation 기사 ID를 찾는 중: {path.name}")
+
         columns = set(pq.ParquetFile(path).schema_arrow.names)
 
         if not {GROUP_COLUMN, "article_id"} <= columns:
@@ -1107,8 +1122,13 @@ def main() -> int:
     print()
     print("  재학습하지 않습니다. 추론하지 않습니다. Test를 쓰지 않습니다.")
 
+    step(f"direct 읽는 중: {direct_path.name}")
     direct = pd.read_parquet(direct_path)
+    print(f"      row {len(direct):,}개")
+
+    step(f"generation 읽는 중: {generation_path.name}")
     generation = pd.read_parquet(generation_path)
+    print(f"      row {len(generation):,}개")
 
     for column, frame, name in (
         ("direct_score", direct, "direct"),
@@ -1378,6 +1398,10 @@ def main() -> int:
 
     return 0
 
+
+from analysis.live_output import enable_line_buffering
+
+enable_line_buffering()
 
 if __name__ == "__main__":
     raise SystemExit(main())

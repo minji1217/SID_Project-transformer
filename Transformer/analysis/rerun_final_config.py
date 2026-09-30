@@ -425,5 +425,9 @@ def main() -> int:
     return 0
 
 
+from analysis.live_output import enable_line_buffering
+
+enable_line_buffering()
+
 if __name__ == "__main__":
     raise SystemExit(main())
